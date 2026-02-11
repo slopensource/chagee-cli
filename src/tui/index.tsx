@@ -26,8 +26,30 @@ interface MenuRow {
 interface MenuVariantPickerState {
   row: MenuRow;
   options: ItemSkuOption[];
-  optionIndex: number;
+  parsedOptions: MenuVariantParsedOption[];
+  dimensions: MenuVariantDimension[];
+  stageIndex: number;
+  choiceIndex: number;
+  selectedValues: Array<string | undefined>;
   qty: number;
+}
+
+interface MenuVariantDimension {
+  key: string;
+  label: string;
+}
+
+interface MenuVariantParsedOption {
+  option: ItemSkuOption;
+  summary: string;
+  valuesByDimension: string[];
+}
+
+interface MenuVariantStageChoice {
+  value: string;
+  priceText: string;
+  previewOption?: ItemSkuOption;
+  combos: number;
 }
 
 interface LayoutMetrics {
@@ -87,6 +109,7 @@ const DISABLE_MOUSE = "\u001b[?1000l\u001b[?1006l";
 const LINE_ACTIVE = "\u0001";
 const LINE_SELECTED = "\u0002";
 const DOUBLE_CLICK_MS = 350;
+const MENU_VARIANT_FOOTER_ROWS = 6;
 const STORE_PANE_RATIO = 0.38;
 const MENU_PANE_RATIO = 0.34;
 const SLASH_COMMANDS: SlashCommandHint[] = [
@@ -373,9 +396,10 @@ function TuiRoot(): React.JSX.Element {
             if (!prev) {
               return prev;
             }
+            const choiceCount = getMenuVariantStageChoices(prev).length;
             return {
               ...prev,
-              optionIndex: clampIndex(prev.optionIndex + delta, prev.options.length)
+              choiceIndex: clampIndex(prev.choiceIndex + delta, choiceCount)
             };
           });
           return;
@@ -409,13 +433,7 @@ function TuiRoot(): React.JSX.Element {
             pushLog(`No sellable variants for ${row.item.name}`);
             return;
           }
-          const matchedIdx = options.findIndex((option) => option.skuId === row.item.skuId);
-          setMenuVariantPicker({
-            row,
-            options,
-            optionIndex: matchedIdx >= 0 ? matchedIdx : 0,
-            qty: 1
-          });
+          setMenuVariantPicker(createMenuVariantPickerState(row, options));
         } finally {
           setBusy(false);
         }
@@ -436,12 +454,20 @@ function TuiRoot(): React.JSX.Element {
 
       if (selection.pane === "menu") {
         if (selection.menuVariantOpen && menuVariantPicker) {
-          const option = menuVariantPicker.options[selection.index];
-          if (!option) {
+          const transition = commitMenuVariantChoice(menuVariantPicker, selection.index);
+          if (transition.mode === "none") {
+            return;
+          }
+          if (transition.mode === "advance") {
+            setMenuVariantPicker(transition.picker);
             return;
           }
           executeCommand(
-            buildAddCommandForVariant(menuVariantPicker.row.item, option, menuVariantPicker.qty)
+            buildAddCommandForVariant(
+              menuVariantPicker.row.item,
+              transition.option,
+              menuVariantPicker.qty
+            )
           );
           setMenuVariantPicker(undefined);
           return;
@@ -637,7 +663,9 @@ function TuiRoot(): React.JSX.Element {
   }, [helpMaxScrollOffset]);
 
   useEffect(() => {
-    const activeMenuLen = menuVariantPicker ? menuVariantPicker.options.length : menuRows.length;
+    const activeMenuLen = menuVariantPicker
+      ? getMenuVariantStageChoices(menuVariantPicker).length
+      : menuRows.length;
     mouseContextRef.current = {
       layout,
       terminalCols,
@@ -646,7 +674,7 @@ function TuiRoot(): React.JSX.Element {
       menuLen: activeMenuLen,
       cartLen: cartLines.length,
       storeIndex,
-      menuIndex: menuVariantPicker ? menuVariantPicker.optionIndex : menuIndex,
+      menuIndex: menuVariantPicker ? menuVariantPicker.choiceIndex : menuIndex,
       cartIndex,
       menuVariantOpen: Boolean(menuVariantPicker)
     };
@@ -749,8 +777,17 @@ function TuiRoot(): React.JSX.Element {
 
     if (focusPane === "cart") {
       const selected = cartLines[cartIndex];
+      if (selected && (key.delete || key.backspace || input.toLowerCase() === "x")) {
+        executeCommand(`/rm ${cartIndex + 1}`);
+        return;
+      }
       if (selected && (key.leftArrow || input === "-")) {
-        executeCommand(`/qty ${cartIndex + 1} ${Math.max(1, selected.qty - 1)}`);
+        const nextQty = selected.qty - 1;
+        if (nextQty <= 0) {
+          executeCommand(`/rm ${cartIndex + 1}`);
+        } else {
+          executeCommand(`/qty ${cartIndex + 1} ${nextQty}`);
+        }
         return;
       }
       if (selected && (key.rightArrow || input === "+")) {
@@ -851,12 +888,20 @@ function TuiRoot(): React.JSX.Element {
       }
       if (focusPane === "menu") {
         if (menuVariantPicker) {
-          const option = menuVariantPicker.options[menuVariantPicker.optionIndex];
-          if (!option) {
+          const transition = commitMenuVariantChoice(menuVariantPicker);
+          if (transition.mode === "none") {
+            return;
+          }
+          if (transition.mode === "advance") {
+            setMenuVariantPicker(transition.picker);
             return;
           }
           executeCommand(
-            buildAddCommandForVariant(menuVariantPicker.row.item, option, menuVariantPicker.qty)
+            buildAddCommandForVariant(
+              menuVariantPicker.row.item,
+              transition.option,
+              menuVariantPicker.qty
+            )
           );
           setMenuVariantPicker(undefined);
           return;
@@ -879,7 +924,18 @@ function TuiRoot(): React.JSX.Element {
 
     if (key.escape) {
       if (focusPane === "menu" && menuVariantPicker) {
-        setMenuVariantPicker(undefined);
+        setMenuVariantPicker((prev) => {
+          if (!prev) {
+            return prev;
+          }
+          if (prev.stageIndex <= 0) {
+            return undefined;
+          }
+          return syncMenuVariantPicker({
+            ...prev,
+            stageIndex: prev.stageIndex - 1
+          });
+        });
       } else if (focusPane === "console" && commandInput.length > 0) {
         setCommandInput("");
       } else if (focusPane === "console" && showHelpPanel) {
@@ -1327,45 +1383,58 @@ function buildMenuVariantPaneLines(
   width: number,
   maxLines: number
 ): string[] {
-  const footerRows = 6;
-  const skuWidth = Math.max(
-    8,
-    "SKU".length,
-    ...picker.options.map((option) => option.skuId.length)
-  );
-  const priceWidth = Math.max(5, "Price".length);
-  const variantWidth = Math.max(8, width - (skuWidth + priceWidth + 6));
+  const currentDimension = picker.dimensions[picker.stageIndex];
+  const stageChoices = getMenuVariantStageChoices(picker);
+  const footerRows = MENU_VARIANT_FOOTER_ROWS;
+  const priceWidth = 9;
+  const combosWidth = 6;
+  const choiceWidth = Math.max(8, width - (priceWidth + combosWidth + 6));
   const visibleRows = Math.max(0, maxLines - (3 + footerRows));
-  const start = windowStart(picker.optionIndex, picker.options.length, visibleRows);
-  const end = Math.min(picker.options.length, start + visibleRows);
+  const start = windowStart(picker.choiceIndex, stageChoices.length, visibleRows);
+  const end = Math.min(stageChoices.length, start + visibleRows);
   const divider = "-".repeat(Math.max(1, width - 2));
+  const selectionSummary = buildVariantSelectionSummary(picker.dimensions, picker.selectedValues);
+  const resolvedOption = resolveMenuVariantOption(picker);
+  const resolvedText = resolvedOption
+    ? `${resolvedOption.skuId} @ ${
+        resolvedOption.price !== undefined ? resolvedOption.price.toFixed(2) : "-"
+      }`
+    : "-";
+
   const lines = [
     `${focused ? "›" : " "} ITEM ${truncate(picker.row.item.name, Math.max(8, width - 7))}`,
-    `  ${fit("SKU", skuWidth)} ${fit("Price", priceWidth)} ${fit("Selection", variantWidth)}`,
+    `  ${fit("Choice", choiceWidth)} ${fit("Price", priceWidth)} ${fit("Combos", combosWidth)}`,
     `  ${divider}`
   ];
 
   for (let i = start; i < end; i += 1) {
-    const option = picker.options[i];
-    if (!option) {
+    const choice = stageChoices[i];
+    if (!choice) {
       continue;
     }
-    const isActive = focused && i === picker.optionIndex;
-    const variant = fit(truncate(option.specText ?? option.name, variantWidth), variantWidth);
-    const price = option.price !== undefined ? option.price.toFixed(2) : "-";
+    const isActive = focused && i === picker.choiceIndex;
     const flags = isActive ? LINE_ACTIVE : "";
-    lines.push(`${flags}  ${fit(option.skuId, skuWidth)} ${fit(price, priceWidth)} ${variant}`);
+    lines.push(
+      `${flags}  ${fit(truncate(choice.value, choiceWidth), choiceWidth)} ${fit(
+        choice.priceText,
+        priceWidth
+      )} ${fit(String(choice.combos), combosWidth)}`
+    );
   }
 
-  const selectedOption = picker.options[picker.optionIndex];
-  const selectedSummary = selectedOption
-    ? selectedOption.specText ?? selectedOption.name ?? selectedOption.skuId
-    : "-";
+  const actionVerb = picker.stageIndex + 1 >= picker.dimensions.length ? "add" : "next";
+  const escAction = picker.stageIndex > 0 ? "prev step" : "close";
 
   lines.push("");
-  lines.push(`Pick one row = full combo (size + ice + sweetness + add-ons).`);
-  lines.push(`Selected ${picker.optionIndex + 1}/${picker.options.length}: ${truncate(selectedSummary, Math.max(8, width - 15))}`);
-  lines.push(`Controls: Up/Down choose  +/- qty  Enter add  Esc back`);
+  lines.push(
+    `Step ${picker.stageIndex + 1}/${picker.dimensions.length}: ${truncate(
+      currentDimension?.label ?? "Option",
+      Math.max(8, width - 15)
+    )}`
+  );
+  lines.push(`Current: ${truncate(selectionSummary, Math.max(8, width - 10))}`);
+  lines.push(`Will add: ${truncate(resolvedText, Math.max(8, width - 11))}`);
+  lines.push(`Controls: Up/Down choose  Enter ${actionVerb}  Esc ${escAction}  +/- qty`);
   lines.push(`Qty: ${picker.qty}`);
   return lines;
 }
@@ -1424,7 +1493,7 @@ function buildCartPaneLines(
   }, 0);
 
   lines.push("");
-  lines.push("Adjust: <-/- down  ->/+ up");
+  lines.push("Adjust: <-/- down (rm at 1)  ->/+ up  Del/x rm");
   lines.push(`Subtotal: ${subtotal > 0 ? subtotal.toFixed(2) : "-"}`);
   lines.push(`Quoted:   ${quoteTotal ?? "-"}`);
   return lines;
@@ -1466,6 +1535,325 @@ function flattenMenuRows(categories: MenuCategory[]): MenuRow[] {
     }
   }
   return rows;
+}
+
+type PickerCommitResult =
+  | { mode: "none" }
+  | { mode: "advance"; picker: MenuVariantPickerState }
+  | { mode: "add"; option: ItemSkuOption };
+
+function createMenuVariantPickerState(
+  row: MenuRow,
+  options: ItemSkuOption[]
+): MenuVariantPickerState {
+  const parsedSegmentsByOption = options.map((option) => {
+    const summary = option.specText ?? option.name ?? option.skuId;
+    return {
+      option,
+      summary,
+      segments: parseVariantSummarySegments(summary)
+    };
+  });
+
+  const dimensions: MenuVariantDimension[] = [];
+  const dimensionIndex = new Map<string, number>();
+
+  for (const parsed of parsedSegmentsByOption) {
+    for (const segment of parsed.segments) {
+      if (dimensionIndex.has(segment.key)) {
+        continue;
+      }
+      const idx = dimensions.length;
+      dimensionIndex.set(segment.key, idx);
+      dimensions.push({ key: segment.key, label: segment.label });
+    }
+  }
+
+  if (dimensions.length === 0) {
+    dimensions.push({ key: "variant", label: "Variant" });
+    dimensionIndex.set("variant", 0);
+  }
+
+  const parsedOptions: MenuVariantParsedOption[] = parsedSegmentsByOption.map((parsed) => {
+    const valueByKey = new Map<string, string>();
+    for (const segment of parsed.segments) {
+      if (!valueByKey.has(segment.key)) {
+        valueByKey.set(segment.key, segment.value);
+      }
+    }
+    const valuesByDimension = dimensions.map((dimension) => valueByKey.get(dimension.key) ?? "-");
+    return {
+      option: parsed.option,
+      summary: parsed.summary,
+      valuesByDimension
+    };
+  });
+
+  const matchedIndex = options.findIndex((option) => option.skuId === row.item.skuId);
+  const defaultIndex = matchedIndex >= 0 ? matchedIndex : 0;
+  const defaultParsed = parsedOptions[defaultIndex] ?? parsedOptions[0];
+  const selectedValues = dimensions.map((_, idx) => defaultParsed?.valuesByDimension[idx] ?? undefined);
+
+  return syncMenuVariantPicker({
+    row,
+    options,
+    parsedOptions,
+    dimensions,
+    stageIndex: 0,
+    choiceIndex: 0,
+    selectedValues,
+    qty: 1
+  });
+}
+
+function parseVariantSummarySegments(summary: string): Array<{
+  key: string;
+  label: string;
+  value: string;
+}> {
+  const segments: Array<{ key: string; label: string; value: string }> = [];
+  const parts = summary
+    .split("|")
+    .map((part) => part.trim())
+    .filter((part) => part.length > 0);
+
+  let unnamedIndex = 0;
+  for (const part of parts) {
+    const separator = part.indexOf(":");
+    if (separator > 0) {
+      const label = part.slice(0, separator).trim();
+      const value = part.slice(separator + 1).trim();
+      const key = normalizeDimensionKey(label || `option_${segments.length + 1}`);
+      segments.push({
+        key,
+        label: label || `Option ${segments.length + 1}`,
+        value: value || "-"
+      });
+      continue;
+    }
+    unnamedIndex += 1;
+    const label = unnamedIndex === 1 ? "Variant" : `Variant ${unnamedIndex}`;
+    segments.push({
+      key: normalizeDimensionKey(label),
+      label,
+      value: part
+    });
+  }
+
+  if (segments.length === 0) {
+    segments.push({
+      key: "variant",
+      label: "Variant",
+      value: summary || "-"
+    });
+  }
+  return segments;
+}
+
+function normalizeDimensionKey(raw: string): string {
+  const normalized = raw.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
+  return normalized || "option";
+}
+
+function getMenuVariantStageChoices(picker: MenuVariantPickerState): MenuVariantStageChoice[] {
+  if (picker.dimensions.length === 0) {
+    return [];
+  }
+  const stageIndex = clampIndex(picker.stageIndex, picker.dimensions.length);
+  const filtered = picker.parsedOptions.filter((parsed) =>
+    matchesVariantSelections(parsed, picker.selectedValues, stageIndex)
+  );
+  const grouped = new Map<
+    string,
+    {
+      prices: number[];
+      combos: number;
+      previewOption: ItemSkuOption;
+    }
+  >();
+
+  for (const parsed of filtered) {
+    const value = parsed.valuesByDimension[stageIndex] ?? "-";
+    const existing = grouped.get(value);
+    if (existing) {
+      existing.combos += 1;
+      if (parsed.option.price !== undefined) {
+        existing.prices.push(parsed.option.price);
+      }
+      continue;
+    }
+    grouped.set(value, {
+      prices: parsed.option.price !== undefined ? [parsed.option.price] : [],
+      combos: 1,
+      previewOption: parsed.option
+    });
+  }
+
+  const choices: MenuVariantStageChoice[] = [];
+  for (const [value, info] of grouped.entries()) {
+    choices.push({
+      value,
+      combos: info.combos,
+      previewOption: info.previewOption,
+      priceText: renderPriceRange(info.prices)
+    });
+  }
+
+  return choices;
+}
+
+function matchesVariantSelections(
+  parsed: MenuVariantParsedOption,
+  selectedValues: Array<string | undefined>,
+  untilStageExclusive: number
+): boolean {
+  for (let i = 0; i < untilStageExclusive; i += 1) {
+    const selected = selectedValues[i];
+    if (!selected) {
+      continue;
+    }
+    if ((parsed.valuesByDimension[i] ?? "-") !== selected) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function renderPriceRange(prices: number[]): string {
+  if (prices.length === 0) {
+    return "-";
+  }
+  const finite = prices.filter((price) => Number.isFinite(price));
+  if (finite.length === 0) {
+    return "-";
+  }
+  const min = Math.min(...finite);
+  const max = Math.max(...finite);
+  if (min === max) {
+    return min.toFixed(2);
+  }
+  return `${min.toFixed(2)}-${max.toFixed(2)}`;
+}
+
+function syncMenuVariantPicker(picker: MenuVariantPickerState): MenuVariantPickerState {
+  if (picker.dimensions.length === 0) {
+    return picker;
+  }
+
+  const stageIndex = clampIndex(picker.stageIndex, picker.dimensions.length);
+  const nextSelected = [...picker.selectedValues];
+  const choices = getMenuVariantStageChoices({ ...picker, stageIndex, selectedValues: nextSelected });
+
+  if (choices.length === 0) {
+    return {
+      ...picker,
+      stageIndex,
+      choiceIndex: 0,
+      selectedValues: nextSelected
+    };
+  }
+
+  const selectedValue = nextSelected[stageIndex];
+  const selectedChoiceIndex =
+    selectedValue !== undefined ? choices.findIndex((choice) => choice.value === selectedValue) : -1;
+  const choiceIndex =
+    selectedChoiceIndex >= 0
+      ? selectedChoiceIndex
+      : clampIndex(picker.choiceIndex, choices.length);
+
+  if (nextSelected[stageIndex] === undefined && choices[choiceIndex]) {
+    nextSelected[stageIndex] = choices[choiceIndex].value;
+  }
+
+  return {
+    ...picker,
+    stageIndex,
+    choiceIndex,
+    selectedValues: nextSelected
+  };
+}
+
+function commitMenuVariantChoice(
+  picker: MenuVariantPickerState,
+  nextChoiceIndex?: number
+): PickerCommitResult {
+  const stageChoices = getMenuVariantStageChoices(picker);
+  const choiceIndex = clampIndex(nextChoiceIndex ?? picker.choiceIndex, stageChoices.length);
+  const chosen = stageChoices[choiceIndex];
+  if (!chosen) {
+    return { mode: "none" };
+  }
+
+  const selectedValues = [...picker.selectedValues];
+  selectedValues[picker.stageIndex] = chosen.value;
+  for (let i = picker.stageIndex + 1; i < selectedValues.length; i += 1) {
+    selectedValues[i] = undefined;
+  }
+
+  if (picker.stageIndex + 1 < picker.dimensions.length) {
+    return {
+      mode: "advance",
+      picker: syncMenuVariantPicker({
+        ...picker,
+        selectedValues,
+        stageIndex: picker.stageIndex + 1,
+        choiceIndex: 0
+      })
+    };
+  }
+
+  const completedPicker = syncMenuVariantPicker({
+    ...picker,
+    selectedValues,
+    choiceIndex
+  });
+  const option = resolveMenuVariantOption(completedPicker);
+  if (!option) {
+    return {
+      mode: "advance",
+      picker: completedPicker
+    };
+  }
+  return {
+    mode: "add",
+    option
+  };
+}
+
+function resolveMenuVariantOption(picker: MenuVariantPickerState): ItemSkuOption | undefined {
+  if (picker.parsedOptions.length === 0 || picker.dimensions.length === 0) {
+    return undefined;
+  }
+  const selectedValues = picker.selectedValues;
+  const fullyMatched = picker.parsedOptions.filter((parsed) =>
+    parsed.valuesByDimension.every((value, idx) => {
+      const selected = selectedValues[idx];
+      return selected !== undefined && value === selected;
+    })
+  );
+  if (fullyMatched.length > 0) {
+    return fullyMatched[0]?.option;
+  }
+
+  const partialMatched = picker.parsedOptions.find((parsed) =>
+    parsed.valuesByDimension.every((value, idx) => {
+      const selected = selectedValues[idx];
+      return selected === undefined || value === selected;
+    })
+  );
+  return partialMatched?.option;
+}
+
+function buildVariantSelectionSummary(
+  dimensions: MenuVariantDimension[],
+  selectedValues: Array<string | undefined>
+): string {
+  if (dimensions.length === 0) {
+    return "-";
+  }
+  return dimensions
+    .map((dimension, idx) => `${dimension.label}: ${selectedValues[idx] ?? "?"}`)
+    .join(" | ");
 }
 
 function buildAddCommandForVariant(item: MenuItem, option: ItemSkuOption, qty: number): string {
@@ -1576,7 +1964,7 @@ function handleMouseEvent(
     if (event.x <= boundaries.secondEnd) {
       setFocusPane("menu");
       const visibleRows = menuVariantOpen
-        ? Math.max(0, paneBodyLines - 9)
+        ? Math.max(0, paneBodyLines - (3 + MENU_VARIANT_FOOTER_ROWS))
         : Math.max(0, paneBodyLines - 3);
       const idx = resolveClickedIndex(event.y, dataStartY, menuIndex, menuLen, visibleRows);
       if (idx !== undefined) {
@@ -1585,7 +1973,7 @@ function handleMouseEvent(
             if (!prev) {
               return prev;
             }
-            return { ...prev, optionIndex: idx };
+            return syncMenuVariantPicker({ ...prev, choiceIndex: idx });
           });
         } else {
           setMenuIndex(() => idx);
