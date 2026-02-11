@@ -60,6 +60,7 @@ export interface CartLine {
   spuId?: string | undefined;
   skuId: string;
   name?: string | undefined;
+  variantText?: string | undefined;
   qty: number;
   price?: number | undefined;
   specList?: Array<{ specId: string; specOptionId: string }> | undefined;

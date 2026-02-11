@@ -111,6 +111,8 @@ const LINE_ACTIVE = "\u0001";
 const LINE_SELECTED = "\u0002";
 const DOUBLE_CLICK_MS = 350;
 const MENU_VARIANT_FOOTER_ROWS = 6;
+const CART_DETAIL_ROWS = 3;
+const CART_FOOTER_ROWS = 3;
 const STORE_PANE_RATIO = 0.38;
 const MENU_PANE_RATIO = 0.34;
 const SLASH_COMMANDS: SlashCommandHint[] = [
@@ -1438,8 +1440,7 @@ function buildCartPaneLines(
   const itemWidth = Math.max(4, "Item".length, String(Math.max(1, cart.length)).length);
   const qtyWidth = Math.max(3, "Qty".length);
   const nameWidth = Math.max(8, width - (itemWidth + qtyWidth + 6));
-  const fixedTailRows = 4;
-  const visibleRows = Math.max(0, maxLines - 3 - fixedTailRows);
+  const { detailsRows, visibleRows } = computeCartLayoutRows(maxLines);
   const start = windowStart(cartIndex, cart.length, visibleRows);
   const end = Math.min(cart.length, start + visibleRows);
   const divider = "-".repeat(Math.max(1, width - 2));
@@ -1473,6 +1474,14 @@ function buildCartPaneLines(
     }
   }
 
+  const renderedRows = Math.max(0, end - start);
+  const fillerRows = Math.max(0, visibleRows - renderedRows);
+  for (let i = 0; i < fillerRows; i += 1) {
+    lines.push("");
+  }
+
+  lines.push(...buildCartDetailLines(cart, cartIndex, width, detailsRows));
+
   const subtotal = cart.reduce((acc, line) => {
     if (line.price === undefined) {
       return acc;
@@ -1480,10 +1489,76 @@ function buildCartPaneLines(
     return acc + line.price * line.qty;
   }, 0);
 
-  lines.push("");
   lines.push("Adjust: <-/- down (rm at 1)  ->/+ up  Del/x rm");
   lines.push(`Subtotal: ${subtotal > 0 ? subtotal.toFixed(2) : "-"}`);
   lines.push(`Quoted:   ${quoteTotal ?? "-"}`);
+  return lines;
+}
+
+function computeCartLayoutRows(maxLines: number): { detailsRows: number; visibleRows: number } {
+  const detailsRows = Math.max(0, Math.min(CART_DETAIL_ROWS, maxLines - 3 - CART_FOOTER_ROWS));
+  const visibleRows = Math.max(0, maxLines - 3 - detailsRows - CART_FOOTER_ROWS);
+  return { detailsRows, visibleRows };
+}
+
+function buildCartDetailLines(
+  cart: CartLine[],
+  cartIndex: number,
+  width: number,
+  detailsRows: number
+): string[] {
+  if (detailsRows <= 0) {
+    return [];
+  }
+
+  const selected = cart[cartIndex];
+  const contentWidth = Math.max(8, width - 2);
+  const lines: string[] = [];
+
+  if (!selected) {
+    lines.push(truncate("Options: -", contentWidth));
+  } else {
+    const rawSegments = (selected.variantText ?? "")
+      .split("|")
+      .map((part) => part.trim())
+      .filter((part) => part.length > 0);
+
+    lines.push(truncate(`Options (Item ${cartIndex + 1}):`, contentWidth));
+
+    if (rawSegments.length === 0) {
+      if ((selected.specList?.length ?? 0) > 0 || (selected.attributeList?.length ?? 0) > 0) {
+        const specCount = selected.specList?.length ?? 0;
+        const attrCount = selected.attributeList?.length ?? 0;
+        lines.push(truncate(`  - ${specCount} spec(s), ${attrCount} attr(s)`, contentWidth));
+      } else {
+        lines.push(truncate("  - none", contentWidth));
+      }
+    } else {
+      const maxOptionRows = Math.max(1, detailsRows - 1);
+      if (rawSegments.length <= maxOptionRows) {
+        for (const segment of rawSegments) {
+          lines.push(truncate(`  - ${segment}`, contentWidth));
+        }
+      } else {
+        const keepRows = Math.max(1, maxOptionRows - 1);
+        for (let i = 0; i < keepRows; i += 1) {
+          const segment = rawSegments[i];
+          if (segment) {
+            lines.push(truncate(`  - ${segment}`, contentWidth));
+          }
+        }
+        const hiddenCount = rawSegments.length - keepRows;
+        lines.push(truncate(`  +${hiddenCount} more`, contentWidth));
+      }
+    }
+  }
+
+  while (lines.length < detailsRows) {
+    lines.push("");
+  }
+  if (lines.length > detailsRows) {
+    return lines.slice(0, detailsRows);
+  }
   return lines;
 }
 
@@ -1934,6 +2009,9 @@ function buildAddCommandForVariant(item: MenuItem, option: ItemSkuOption, qty: n
   if (displayName) {
     args.push(`name="${displayName.replace(/"/g, '\\"')}"`);
   }
+  if (option.specText) {
+    args.push(`variant="${option.specText.replace(/"/g, '\\"')}"`);
+  }
   if (option.price !== undefined) {
     args.push(`price=${option.price}`);
   }
@@ -2057,7 +2135,7 @@ function handleMouseEvent(
       return;
     }
     setFocusPane("cart");
-    const visibleRows = Math.max(0, paneBodyLines - 7);
+    const { visibleRows } = computeCartLayoutRows(paneBodyLines);
     const idx = resolveClickedIndex(event.y, dataStartY, cartIndex, cartLen, visibleRows);
     if (idx !== undefined) {
       setCartIndex(() => idx);

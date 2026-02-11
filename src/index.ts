@@ -1335,6 +1335,7 @@ export class App {
         skuId,
         spuId: parsed.opts.spuId,
         name: parsed.opts.name,
+        variantText: parsed.opts.variant,
         qty,
         price: parsed.opts.price ? parseNum(parsed.opts.price, 0) : undefined,
         specList,
