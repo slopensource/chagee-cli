@@ -76,6 +76,7 @@ interface MouseContext {
   focusPane: FocusPane;
   storesLen: number;
   menuLen: number;
+  menuVariantFooterRows: number;
   cartLen: number;
   storeIndex: number;
   menuIndex: number;
@@ -249,6 +250,7 @@ function TuiRoot(): React.JSX.Element {
     focusPane,
     storesLen: stores.length,
     menuLen: menuRows.length,
+    menuVariantFooterRows: 0,
     cartLen: cartLines.length,
     storeIndex,
     menuIndex,
@@ -666,12 +668,16 @@ function TuiRoot(): React.JSX.Element {
     const activeMenuLen = menuVariantPicker
       ? getMenuVariantStageChoices(menuVariantPicker).length
       : menuRows.length;
+    const menuVariantFooterRows = menuVariantPicker
+      ? buildMenuVariantFooterLines(menuVariantPicker, menuPaneTextWidth).length + 1
+      : 0;
     mouseContextRef.current = {
       layout,
       terminalCols,
       focusPane,
       storesLen: stores.length,
       menuLen: activeMenuLen,
+      menuVariantFooterRows,
       cartLen: cartLines.length,
       storeIndex,
       menuIndex: menuVariantPicker ? menuVariantPicker.choiceIndex : menuIndex,
@@ -686,6 +692,7 @@ function TuiRoot(): React.JSX.Element {
     menuIndex,
     menuRows.length,
     menuVariantPicker,
+    menuPaneTextWidth,
     storeIndex,
     stores.length,
     terminalCols
@@ -1383,23 +1390,16 @@ function buildMenuVariantPaneLines(
   width: number,
   maxLines: number
 ): string[] {
-  const currentDimension = picker.dimensions[picker.stageIndex];
   const stageChoices = getMenuVariantStageChoices(picker);
-  const footerRows = MENU_VARIANT_FOOTER_ROWS;
-  const priceWidth = 9;
+  const footerLines = buildMenuVariantFooterLines(picker, width);
+  const footerRows = footerLines.length + 1;
+  const priceWidth = 7;
   const combosWidth = 6;
   const choiceWidth = Math.max(8, width - (priceWidth + combosWidth + 6));
   const visibleRows = Math.max(0, maxLines - (3 + footerRows));
   const start = windowStart(picker.choiceIndex, stageChoices.length, visibleRows);
   const end = Math.min(stageChoices.length, start + visibleRows);
   const divider = "-".repeat(Math.max(1, width - 2));
-  const selectionSummary = buildVariantSelectionSummary(picker.dimensions, picker.selectedValues);
-  const resolvedOption = resolveMenuVariantOption(picker);
-  const resolvedText = resolvedOption
-    ? `${resolvedOption.skuId} @ ${
-        resolvedOption.price !== undefined ? resolvedOption.price.toFixed(2) : "-"
-      }`
-    : "-";
 
   const lines = [
     `${focused ? "›" : " "} ITEM ${truncate(picker.row.item.name, Math.max(8, width - 7))}`,
@@ -1415,27 +1415,15 @@ function buildMenuVariantPaneLines(
     const isActive = focused && i === picker.choiceIndex;
     const flags = isActive ? LINE_ACTIVE : "";
     lines.push(
-      `${flags}  ${fit(truncate(choice.value, choiceWidth), choiceWidth)} ${fit(
+      `${flags}  ${fit(choice.value, choiceWidth)} ${fit(
         choice.priceText,
         priceWidth
       )} ${fit(String(choice.combos), combosWidth)}`
     );
   }
 
-  const actionVerb = picker.stageIndex + 1 >= picker.dimensions.length ? "add" : "next";
-  const escAction = picker.stageIndex > 0 ? "prev step" : "close";
-
   lines.push("");
-  lines.push(
-    `Step ${picker.stageIndex + 1}/${picker.dimensions.length}: ${truncate(
-      currentDimension?.label ?? "Option",
-      Math.max(8, width - 15)
-    )}`
-  );
-  lines.push(`Current: ${truncate(selectionSummary, Math.max(8, width - 10))}`);
-  lines.push(`Will add: ${truncate(resolvedText, Math.max(8, width - 11))}`);
-  lines.push(`Controls: Up/Down choose  Enter ${actionVerb}  Esc ${escAction}  +/- qty`);
-  lines.push(`Qty: ${picker.qty}`);
+  lines.push(...footerLines);
   return lines;
 }
 
@@ -1574,6 +1562,7 @@ function createMenuVariantPickerState(
     dimensionIndex.set("variant", 0);
   }
 
+  const orderedDimensions = orderMenuVariantDimensions(dimensions);
   const parsedOptions: MenuVariantParsedOption[] = parsedSegmentsByOption.map((parsed) => {
     const valueByKey = new Map<string, string>();
     for (const segment of parsed.segments) {
@@ -1581,7 +1570,9 @@ function createMenuVariantPickerState(
         valueByKey.set(segment.key, segment.value);
       }
     }
-    const valuesByDimension = dimensions.map((dimension) => valueByKey.get(dimension.key) ?? "-");
+    const valuesByDimension = orderedDimensions.map(
+      (dimension) => valueByKey.get(dimension.key) ?? "-"
+    );
     return {
       option: parsed.option,
       summary: parsed.summary,
@@ -1592,13 +1583,15 @@ function createMenuVariantPickerState(
   const matchedIndex = options.findIndex((option) => option.skuId === row.item.skuId);
   const defaultIndex = matchedIndex >= 0 ? matchedIndex : 0;
   const defaultParsed = parsedOptions[defaultIndex] ?? parsedOptions[0];
-  const selectedValues = dimensions.map((_, idx) => defaultParsed?.valuesByDimension[idx] ?? undefined);
+  const selectedValues = orderedDimensions.map(
+    (_, idx) => defaultParsed?.valuesByDimension[idx] ?? undefined
+  );
 
   return syncMenuVariantPicker({
     row,
     options,
     parsedOptions,
-    dimensions,
+    dimensions: orderedDimensions,
     stageIndex: 0,
     choiceIndex: 0,
     selectedValues,
@@ -1653,6 +1646,39 @@ function parseVariantSummarySegments(summary: string): Array<{
 function normalizeDimensionKey(raw: string): string {
   const normalized = raw.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
   return normalized || "option";
+}
+
+function orderMenuVariantDimensions(dimensions: MenuVariantDimension[]): MenuVariantDimension[] {
+  return dimensions
+    .map((dimension, index) => ({ dimension, index }))
+    .sort((left, right) => {
+      const leftPriority = menuVariantDimensionPriority(left.dimension);
+      const rightPriority = menuVariantDimensionPriority(right.dimension);
+      if (leftPriority !== rightPriority) {
+        return leftPriority - rightPriority;
+      }
+      return left.index - right.index;
+    })
+    .map((entry) => entry.dimension);
+}
+
+function menuVariantDimensionPriority(dimension: MenuVariantDimension): number {
+  const normalized = `${dimension.key} ${dimension.label}`.toLowerCase();
+  if (
+    dimension.key === "variant" ||
+    normalized.includes("size") ||
+    normalized.includes("milk") ||
+    normalized.includes("cup")
+  ) {
+    return 0;
+  }
+  if (normalized.includes("ice")) {
+    return 1;
+  }
+  if (normalized.includes("sweet") || normalized.includes("sugar")) {
+    return 2;
+  }
+  return 10;
 }
 
 function getMenuVariantStageChoices(picker: MenuVariantPickerState): MenuVariantStageChoice[] {
@@ -1844,16 +1870,57 @@ function resolveMenuVariantOption(picker: MenuVariantPickerState): ItemSkuOption
   return partialMatched?.option;
 }
 
-function buildVariantSelectionSummary(
-  dimensions: MenuVariantDimension[],
-  selectedValues: Array<string | undefined>
-): string {
-  if (dimensions.length === 0) {
-    return "-";
+function buildMenuVariantFooterLines(picker: MenuVariantPickerState, width: number): string[] {
+  const currentDimension = picker.dimensions[picker.stageIndex];
+  const actionVerb = picker.stageIndex + 1 >= picker.dimensions.length ? "add" : "next";
+  const escAction = picker.stageIndex > 0 ? "prev step" : "close";
+  const resolvedOption = resolveMenuVariantOption(picker);
+  const resolvedText = resolvedOption
+    ? `${resolvedOption.skuId} @ ${
+        resolvedOption.price !== undefined ? resolvedOption.price.toFixed(2) : "-"
+      }`
+    : "-";
+  const lines: string[] = [];
+
+  lines.push(`Step ${picker.stageIndex + 1}/${picker.dimensions.length}: ${currentDimension?.label ?? "Option"}`);
+  lines.push("Current:");
+  for (let i = 0; i < picker.dimensions.length; i += 1) {
+    const dimension = picker.dimensions[i];
+    if (!dimension) {
+      continue;
+    }
+    lines.push(`  ${dimension.label}: ${picker.selectedValues[i] ?? "?"}`);
   }
-  return dimensions
-    .map((dimension, idx) => `${dimension.label}: ${selectedValues[idx] ?? "?"}`)
-    .join(" | ");
+  lines.push(`Will add: ${resolvedText}`);
+  lines.push(`Controls: Up/Down choose  Enter ${actionVerb}  Esc ${escAction}`);
+  lines.push("          +/- qty");
+  lines.push(`Qty: ${picker.qty}`);
+
+  return lines.flatMap((line) => wrapPaneLine(line, width));
+}
+
+function wrapPaneLine(line: string, width: number): string[] {
+  const safeWidth = Math.max(8, width);
+  if (line.length <= safeWidth) {
+    return [line];
+  }
+  const indent = line.match(/^\s*/)?.[0] ?? "";
+  const continuationPrefix = indent.length > 0 ? indent : "  ";
+  const out: string[] = [];
+  let remaining = line;
+
+  while (remaining.length > safeWidth) {
+    let breakAt = remaining.lastIndexOf(" ", safeWidth);
+    if (breakAt <= 0) {
+      breakAt = safeWidth;
+    }
+    out.push(remaining.slice(0, breakAt).trimEnd());
+    remaining = `${continuationPrefix}${remaining.slice(breakAt).trimStart()}`;
+  }
+  if (remaining.length > 0) {
+    out.push(remaining);
+  }
+  return out.length > 0 ? out : [""];
 }
 
 function buildAddCommandForVariant(item: MenuItem, option: ItemSkuOption, qty: number): string {
@@ -1921,6 +1988,7 @@ function handleMouseEvent(
     terminalCols,
     storesLen,
     menuLen,
+    menuVariantFooterRows,
     cartLen,
     storeIndex,
     menuIndex,
@@ -1963,8 +2031,10 @@ function handleMouseEvent(
     }
     if (event.x <= boundaries.secondEnd) {
       setFocusPane("menu");
+      const variantFooterRows =
+        menuVariantFooterRows > 0 ? menuVariantFooterRows : MENU_VARIANT_FOOTER_ROWS;
       const visibleRows = menuVariantOpen
-        ? Math.max(0, paneBodyLines - (3 + MENU_VARIANT_FOOTER_ROWS))
+        ? Math.max(0, paneBodyLines - (3 + variantFooterRows))
         : Math.max(0, paneBodyLines - 3);
       const idx = resolveClickedIndex(event.y, dataStartY, menuIndex, menuLen, visibleRows);
       if (idx !== undefined) {
