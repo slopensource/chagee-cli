@@ -1426,14 +1426,18 @@ function buildMenuPaneLines(
   width: number,
   maxLines: number
 ): string[] {
-  const nameWidth = Math.max(8, width - 2);
+  const sectionWidth = Math.max(12, Math.min(28, Math.floor(width * 0.38)));
+  const itemWidth = Math.max(8, width - sectionWidth - 3);
   const visibleRows = Math.max(0, maxLines - 3);
   const start = windowStart(menuIndex, menuRows.length, visibleRows);
   const end = Math.min(menuRows.length, start + visibleRows);
   const divider = "-".repeat(Math.max(1, width - 2));
+  const uniqueSections = new Set(
+    menuRows.map((row) => row.categoryName.trim().toLowerCase()).filter((name) => name.length > 0)
+  ).size;
   const lines = [
-    `${focused ? "›" : " "} MENU (${menuRows.length})`,
-    `  ${fit("Name", nameWidth)}`,
+    `${focused ? "›" : " "} MENU (${menuRows.length}/${uniqueSections})`,
+    `  ${fit("Section", sectionWidth)} ${fit("Item", itemWidth)}`,
     `  ${divider}`
   ];
   for (let i = start; i < end; i += 1) {
@@ -1442,9 +1446,10 @@ function buildMenuPaneLines(
       continue;
     }
     const isActive = focused && i === menuIndex;
-    const name = fit(row.item.name, nameWidth);
+    const categoryName = fit(row.categoryName || "-", sectionWidth);
+    const itemName = fit(row.item.name, itemWidth);
     const flags = isActive ? LINE_ACTIVE : "";
-    lines.push(`${flags}  ${name}`);
+    lines.push(`${flags}  ${categoryName} ${itemName}`);
   }
   if (start > 0 && lines.length > 1) {
     const header = lines[1];

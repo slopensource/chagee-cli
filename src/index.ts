@@ -154,6 +154,7 @@ interface BrowserTokenCaptureResult {
 const LOCATION_SOURCES: readonly LocationSource[] = ["default", "ip", "browser", "manual"];
 const LOCATION_HEARTBEAT_MS = 60 * 1000;
 const LOCATION_CHANGE_EPSILON = 0.000001;
+const ITEM_OPTION_PRINT_LIMIT = 24;
 
 export class App {
   private state: AppState = createInitialState();
@@ -1601,13 +1602,18 @@ export class App {
       this.printData(envelopeData(res));
       return;
     }
-    const rows = options.map((option) => [
+    const rows = options.slice(0, ITEM_OPTION_PRINT_LIMIT).map((option) => [
       option.skuId,
       option.price !== undefined ? option.price.toFixed(2) : "-",
       option.specText ?? "-",
       option.name
     ]);
     printTable(["skuId", "price", "variant", "name"], rows);
+    if (options.length > ITEM_OPTION_PRINT_LIMIT) {
+      console.log(
+        `... ${options.length - ITEM_OPTION_PRINT_LIMIT} more option(s). Use the TUI variant picker to browse all.`
+      );
+    }
   }
 
   private async cmdCart(rest: string[]): Promise<void> {
@@ -3207,24 +3213,80 @@ function asArray(value: unknown): unknown[] | undefined {
   return Array.isArray(value) ? value : undefined;
 }
 
+const MENU_CATEGORY_ARRAY_KEYS = [
+  "menuList",
+  "classifyList",
+  "categoryList",
+  "goodsClassifyList",
+  "goodsCategoryList",
+  "menuCategoryList",
+  "classificationList",
+  "classList",
+  "leftClassifyList",
+  "list"
+] as const;
+
+const MENU_CATEGORY_ID_KEYS = [
+  "categoryId",
+  "menuCategoryId",
+  "classifyId",
+  "classificationId",
+  "goodsClassifyId",
+  "goodsCategoryId",
+  "id"
+] as const;
+
+const MENU_CATEGORY_NAME_KEYS = [
+  "categoryName",
+  "menuCategoryName",
+  "classifyName",
+  "classificationName",
+  "goodsClassifyName",
+  "goodsCategoryName",
+  "title",
+  "name"
+] as const;
+
+const MENU_ITEM_ARRAY_KEYS = [
+  "goodsList",
+  "spuList",
+  "goodsSpuList",
+  "productList",
+  "itemList",
+  "items",
+  "menuGoodsList",
+  "list"
+] as const;
+
+const MENU_GROUP_ARRAY_KEYS = [
+  "goodsGroupList",
+  "groupList",
+  "subClassifyList",
+  "children",
+  "tabs"
+] as const;
+
 function extractMenuCategories(data: unknown): MenuCategory[] {
-  const categoryCandidates = [
-    data,
-    (data as Record<string, unknown> | undefined)?.menuList,
-    (data as Record<string, unknown> | undefined)?.classifyList,
-    (data as Record<string, unknown> | undefined)?.categoryList,
-    (data as Record<string, unknown> | undefined)?.list
-  ];
+  const root = data && typeof data === "object" ? (data as Record<string, unknown>) : undefined;
+  const nestedRoot =
+    root?.data && typeof root.data === "object"
+      ? (root.data as Record<string, unknown>)
+      : undefined;
+  const categoryCandidates: unknown[] = [data];
+
+  if (root) {
+    for (const key of MENU_CATEGORY_ARRAY_KEYS) {
+      categoryCandidates.push(root[key]);
+    }
+  }
+  if (nestedRoot) {
+    for (const key of MENU_CATEGORY_ARRAY_KEYS) {
+      categoryCandidates.push(nestedRoot[key]);
+    }
+  }
 
   for (const candidate of categoryCandidates) {
-    const arr = asArray(candidate);
-    if (!arr || arr.length === 0) {
-      continue;
-    }
-
-    const categories = arr
-      .map((raw) => mapCategory(raw))
-      .filter((c): c is MenuCategory => c !== undefined);
+    const categories = mapMenuCategoryArray(candidate);
     if (categories.length > 0) {
       return categories;
     }
@@ -3233,40 +3295,125 @@ function extractMenuCategories(data: unknown): MenuCategory[] {
   return [];
 }
 
+function mapMenuCategoryArray(raw: unknown): MenuCategory[] {
+  const arr = asArray(raw);
+  if (!arr || arr.length === 0) {
+    return [];
+  }
+  const categories = arr
+    .map((entry) => mapCategory(entry))
+    .filter((category): category is MenuCategory => category !== undefined);
+  if (categories.length === 0) {
+    return [];
+  }
+  return dedupeMenuCategories(categories);
+}
+
+function dedupeMenuCategories(categories: MenuCategory[]): MenuCategory[] {
+  const deduped: MenuCategory[] = [];
+  const indexByKey = new Map<string, number>();
+
+  for (const category of categories) {
+    if (category.items.length === 0) {
+      continue;
+    }
+    const key = `${category.id || category.name}`.trim().toLowerCase();
+    const existingIdx = indexByKey.get(key);
+    if (existingIdx === undefined) {
+      deduped.push({
+        id: category.id,
+        name: category.name,
+        items: dedupeMenuItems(category.items)
+      });
+      indexByKey.set(key, deduped.length - 1);
+      continue;
+    }
+
+    const existing = deduped[existingIdx];
+    if (!existing) {
+      continue;
+    }
+    existing.items = dedupeMenuItems([...existing.items, ...category.items]);
+  }
+
+  return deduped.filter((category) => category.items.length > 0);
+}
+
+function dedupeMenuItems(items: MenuItem[]): MenuItem[] {
+  const seen = new Set<string>();
+  const out: MenuItem[] = [];
+  for (const item of items) {
+    const key = `${item.spuId}:${item.skuId ?? ""}`;
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    out.push(item);
+  }
+  return out;
+}
+
+function firstString(obj: Record<string, unknown>, keys: readonly string[]): string {
+  for (const key of keys) {
+    const value = asString(obj[key]);
+    if (value) {
+      return value;
+    }
+  }
+  return "";
+}
+
+function mapItemsFromArray(raw: unknown): MenuItem[] {
+  const arr = asArray(raw);
+  if (!arr || arr.length === 0) {
+    return [];
+  }
+  return arr.map((entry) => mapItem(entry)).filter((item): item is MenuItem => item !== undefined);
+}
+
+function extractCategoryItems(obj: Record<string, unknown>): MenuItem[] {
+  for (const key of MENU_ITEM_ARRAY_KEYS) {
+    const items = mapItemsFromArray(obj[key]);
+    if (items.length > 0) {
+      return dedupeMenuItems(items);
+    }
+  }
+
+  const groupedItems: MenuItem[] = [];
+  for (const groupKey of MENU_GROUP_ARRAY_KEYS) {
+    const groups = asArray(obj[groupKey]);
+    if (!groups || groups.length === 0) {
+      continue;
+    }
+    for (const rawGroup of groups) {
+      if (!rawGroup || typeof rawGroup !== "object") {
+        continue;
+      }
+      const groupObj = rawGroup as Record<string, unknown>;
+      for (const itemKey of MENU_ITEM_ARRAY_KEYS) {
+        const items = mapItemsFromArray(groupObj[itemKey]);
+        if (items.length > 0) {
+          groupedItems.push(...items);
+        }
+      }
+    }
+  }
+  return groupedItems.length > 0 ? dedupeMenuItems(groupedItems) : [];
+}
+
 function mapCategory(raw: unknown): MenuCategory | undefined {
   if (!raw || typeof raw !== "object") {
     return undefined;
   }
   const obj = raw as Record<string, unknown>;
-  const id =
-    asString(obj.categoryId) ??
-    asString(obj.menuCategoryId) ??
-    asString(obj.classifyId) ??
-    asString(obj.id) ??
-    "";
-  const name =
-    asString(obj.categoryName) ??
-    asString(obj.menuCategoryName) ??
-    asString(obj.classifyName) ??
-    asString(obj.name) ??
-    "";
-
-  const itemCandidates = [obj.goodsList, obj.spuList, obj.items, obj.list];
-  let items: MenuItem[] = [];
-  for (const candidate of itemCandidates) {
-    const arr = asArray(candidate);
-    if (!arr) {
-      continue;
-    }
-    items = arr
-      .map((x) => mapItem(x))
-      .filter((item): item is MenuItem => item !== undefined);
-    if (items.length > 0) {
-      break;
-    }
-  }
+  const id = firstString(obj, MENU_CATEGORY_ID_KEYS);
+  const name = firstString(obj, MENU_CATEGORY_NAME_KEYS);
+  const items = extractCategoryItems(obj);
 
   if (!id && !name) {
+    return undefined;
+  }
+  if (items.length === 0) {
     return undefined;
   }
 
@@ -3282,16 +3429,28 @@ function mapItem(raw: unknown): MenuItem | undefined {
     return undefined;
   }
   const obj = raw as Record<string, unknown>;
-  const spuId = asString(obj.spuId) ?? asString(obj.id) ?? "";
-  const skuId = asString(obj.skuId);
-  const name = asString(obj.spuName) ?? asString(obj.name) ?? asString(obj.title) ?? "";
+  const spuId = asString(obj.spuId) ?? asString(obj.goodsId) ?? asString(obj.id) ?? "";
+  const skuId = asString(obj.skuId) ?? asString(obj.defaultSkuId);
+  const name =
+    asString(obj.spuName) ??
+    asString(obj.goodsName) ??
+    asString(obj.name) ??
+    asString(obj.title) ??
+    "";
   const price =
-    toNum(obj.salePrice) ?? toNum(obj.unitTradePrice) ?? toNum(obj.price) ?? undefined;
+    toNum(obj.salePrice) ??
+    toNum(obj.unitTradePrice) ??
+    toNum(obj.price) ??
+    toNum(obj.minPrice) ??
+    undefined;
 
   if (!spuId || !name) {
     return undefined;
   }
   if (isMenuItemOutOfStock(obj)) {
+    return undefined;
+  }
+  if (isComboMenuItemUnavailable(obj)) {
     return undefined;
   }
 
@@ -3311,6 +3470,11 @@ function extractItemSkuOptions(data: unknown): ItemSkuOption[] {
   }
 
   const rootName = asString(detailRoot.name) ?? asString(detailRoot.spuName) ?? "";
+  const comboOptions = extractComboItemSkuOptions(detailRoot, rootName);
+  if (comboOptions.length > 0) {
+    return dedupeItemSkuOptions(comboOptions);
+  }
+
   const skuList =
     asArray(detailRoot.skuList) ??
     asArray(detailRoot.goodsSkuList) ??
@@ -3353,7 +3517,7 @@ function extractItemSkuOptions(data: unknown): ItemSkuOption[] {
   }
 
   if (options.length > 0) {
-    return expandSkuOptionsWithSpuAttributes(options, detailRoot);
+    return dedupeItemSkuOptions(expandSkuOptionsWithSpuAttributes(options, detailRoot));
   }
 
   const fallbackSkuId = asString(detailRoot.skuId);
@@ -3367,10 +3531,364 @@ function extractItemSkuOptions(data: unknown): ItemSkuOption[] {
       price:
         toNum(detailRoot.salePrice) ??
         toNum(detailRoot.unitTradePrice) ??
-        toNum(detailRoot.price) ??
-        undefined
+      toNum(detailRoot.price) ??
+      undefined
     }
   ];
+}
+
+const MAX_COMBO_VARIANT_OPTIONS = 128;
+
+interface ComboComponentSelection {
+  groupName: string;
+  quantity: number;
+  component: Record<string, unknown>;
+}
+
+function extractComboItemSkuOptions(
+  detailRoot: Record<string, unknown>,
+  rootName: string
+): ItemSkuOption[] {
+  const primarySku = pickPrimarySkuRecord(detailRoot);
+  const bundleSkuId = asString(primarySku?.skuId) ?? asString(detailRoot.skuId);
+  if (!bundleSkuId) {
+    return [];
+  }
+
+  const basePrice =
+    toNum(primarySku?.salePrice) ??
+    toNum(primarySku?.unitTradePrice) ??
+    toNum(primarySku?.price) ??
+    toNum(detailRoot.defaultSalePrice) ??
+    toNum(detailRoot.salePrice) ??
+    toNum(detailRoot.unitTradePrice) ??
+    toNum(detailRoot.price) ??
+    undefined;
+
+  const selections = buildComboSelections(detailRoot);
+  if (selections.length === 0) {
+    return [];
+  }
+
+  const out: ItemSkuOption[] = [];
+  for (const selection of selections) {
+    const built = buildComboOptionsForSelection(selection, bundleSkuId, rootName || bundleSkuId, basePrice);
+    if (built.length > 0) {
+      out.push(...built);
+    }
+    if (out.length >= MAX_COMBO_VARIANT_OPTIONS) {
+      break;
+    }
+  }
+  return dedupeItemSkuOptions(out).slice(0, MAX_COMBO_VARIANT_OPTIONS);
+}
+
+function pickPrimarySkuRecord(detailRoot: Record<string, unknown>): Record<string, unknown> | undefined {
+  const skuList =
+    asArray(detailRoot.skuList) ??
+    asArray(detailRoot.goodsSkuList) ??
+    asArray(detailRoot.saleSkuList) ??
+    [];
+  for (const rawSku of skuList) {
+    if (!rawSku || typeof rawSku !== "object") {
+      continue;
+    }
+    const sku = rawSku as Record<string, unknown>;
+    if (!isMenuItemOutOfStock(sku)) {
+      return sku;
+    }
+  }
+  for (const rawSku of skuList) {
+    if (rawSku && typeof rawSku === "object") {
+      return rawSku as Record<string, unknown>;
+    }
+  }
+  return undefined;
+}
+
+function buildComboSelections(detailRoot: Record<string, unknown>): ComboComponentSelection[][] {
+  const rawGroups = asArray(detailRoot.comboGroupList) ?? [];
+  if (rawGroups.length > 0) {
+    return buildComboSelectionsFromGroups(rawGroups);
+  }
+
+  const rawFixed = asArray(detailRoot.comboSkuList) ?? [];
+  if (rawFixed.length === 0) {
+    return [];
+  }
+  const availableFixed = rawFixed
+    .filter((raw): raw is Record<string, unknown> => raw !== null && typeof raw === "object")
+    .filter((component) => !isMenuItemOutOfStock(component));
+
+  if (availableFixed.length === 0) {
+    return [];
+  }
+  // Fixed bundles require all listed components to be available.
+  if (availableFixed.length < rawFixed.length) {
+    return [];
+  }
+  return [
+    availableFixed.map((component) => ({
+      groupName: "Bundle",
+      quantity: Math.max(1, Math.floor(toNum(component.num) ?? 1)),
+      component
+    }))
+  ];
+}
+
+function buildComboSelectionsFromGroups(rawGroups: unknown[]): ComboComponentSelection[][] {
+  const groups: Array<{
+    name: string;
+    required: boolean;
+    quantity: number;
+    choices: Record<string, unknown>[];
+  }> = [];
+
+  for (const rawGroup of rawGroups) {
+    if (!rawGroup || typeof rawGroup !== "object") {
+      continue;
+    }
+    const groupObj = rawGroup as Record<string, unknown>;
+    const groupName =
+      asString(groupObj.comboGroupName) ??
+      asString(groupObj.groupName) ??
+      asString(groupObj.name) ??
+      "Combo";
+    const groupType = (asString(groupObj.groupType) ?? "").toLowerCase();
+    const quantityRaw = toNum(groupObj.quantity);
+    const quantity =
+      quantityRaw !== undefined && Number.isFinite(quantityRaw)
+        ? Math.max(1, Math.floor(quantityRaw))
+        : 1;
+    const required = toBool(groupObj.required) === true || groupType === "must" || quantity > 0;
+    const rawChoices =
+      asArray(groupObj.comboSkuList) ?? asArray(groupObj.comboGroupSkuList) ?? asArray(groupObj.skuList) ?? [];
+    const choices = rawChoices
+      .filter((raw): raw is Record<string, unknown> => raw !== null && typeof raw === "object")
+      .filter((choice) => !isMenuItemOutOfStock(choice));
+    if (choices.length === 0) {
+      if (required && rawChoices.length > 0) {
+        return [];
+      }
+      continue;
+    }
+    groups.push({
+      name: groupName,
+      required,
+      quantity,
+      choices
+    });
+  }
+
+  if (groups.length === 0) {
+    return [];
+  }
+
+  let selections: ComboComponentSelection[][] = [[]];
+  for (const group of groups) {
+    const groupSelections = buildSelectionsForGroup(group);
+    if (groupSelections.length === 0) {
+      if (group.required) {
+        return [];
+      }
+      continue;
+    }
+    const next: ComboComponentSelection[][] = [];
+    for (const existing of selections) {
+      for (const groupSelection of groupSelections) {
+        next.push([...existing, ...groupSelection]);
+        if (next.length >= MAX_COMBO_VARIANT_OPTIONS) {
+          break;
+        }
+      }
+      if (next.length >= MAX_COMBO_VARIANT_OPTIONS) {
+        break;
+      }
+    }
+    selections = next;
+    if (selections.length === 0) {
+      return [];
+    }
+  }
+
+  return selections
+    .filter((selection) => selection.length > 0)
+    .slice(0, MAX_COMBO_VARIANT_OPTIONS);
+}
+
+function buildSelectionsForGroup(group: {
+  name: string;
+  quantity: number;
+  choices: Record<string, unknown>[];
+}): ComboComponentSelection[][] {
+  if (group.quantity <= 1) {
+    return group.choices.map((choice) => [
+      {
+        groupName: group.name,
+        quantity: Math.max(1, Math.floor(toNum(choice.num) ?? 1)),
+        component: choice
+      }
+    ]);
+  }
+  if (group.choices.length < group.quantity) {
+    return [];
+  }
+  const picked = group.choices.slice(0, group.quantity);
+  return [
+    picked.map((choice) => ({
+      groupName: group.name,
+      quantity: Math.max(1, Math.floor(toNum(choice.num) ?? 1)),
+      component: choice
+    }))
+  ];
+}
+
+function buildComboOptionsForSelection(
+  selection: ComboComponentSelection[],
+  bundleSkuId: string,
+  rootName: string,
+  basePrice: number | undefined
+): ItemSkuOption[] {
+  if (selection.length === 0) {
+    return [];
+  }
+
+  const primaryComponent =
+    selection.find((entry) => {
+      const specCount = asArray(entry.component.specList)?.length ?? 0;
+      if (specCount > 0) {
+        return true;
+      }
+      const attrGroups = extractSpuAttributeGroups(entry.component);
+      return attrGroups.length > 0;
+    }) ?? selection[0];
+  if (!primaryComponent) {
+    return [];
+  }
+
+  const componentLabels = selection.map((entry) => {
+    const name =
+      asString(entry.component.name) ??
+      asString(entry.component.spuName) ??
+      asString(entry.component.skuName) ??
+      asString(entry.component.skuId) ??
+      "Item";
+    const qtySuffix = entry.quantity > 1 ? ` x${entry.quantity}` : "";
+    return `${entry.groupName}: ${name}${qtySuffix}`;
+  });
+
+  const specNames = parseOptionNames(primaryComponent.component.specList);
+  const specTextParts = [...componentLabels];
+  if (specNames.length > 0) {
+    specTextParts.push(`Variant: ${specNames.join(" + ")}`);
+  }
+
+  const optionPrice = resolveComboSelectionPrice(selection, basePrice);
+  const baseOption: ItemSkuOption = {
+    skuId: bundleSkuId,
+    name: rootName,
+    price: optionPrice,
+    specText: specTextParts.join(" | "),
+    specList: parseSpecPairs(primaryComponent.component.specList),
+    attributeList: parseAttributePairs(primaryComponent.component.attributeList)
+  };
+
+  return expandSkuOptionsWithSpuAttributes([baseOption], primaryComponent.component);
+}
+
+function resolveComboSelectionPrice(
+  selection: ComboComponentSelection[],
+  basePrice: number | undefined
+): number | undefined {
+  let comboPriceSum = 0;
+  let hasComboPrice = false;
+  for (const entry of selection) {
+    const comboPrice = toNum(entry.component.comboPrice);
+    if (comboPrice === undefined) {
+      continue;
+    }
+    hasComboPrice = true;
+    comboPriceSum += comboPrice;
+  }
+  if (hasComboPrice && (comboPriceSum > 0 || basePrice === undefined)) {
+    return comboPriceSum;
+  }
+  return basePrice;
+}
+
+function dedupeItemSkuOptions(options: ItemSkuOption[]): ItemSkuOption[] {
+  const seen = new Set<string>();
+  const out: ItemSkuOption[] = [];
+  for (const option of options) {
+    if (!option.skuId) {
+      continue;
+    }
+    const key = [
+      option.skuId,
+      option.specText ?? "",
+      option.price !== undefined ? option.price.toFixed(2) : "",
+      normalizedPairKey(option.specList),
+      normalizedAttributeKey(option.attributeList)
+    ].join("|");
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    out.push(option);
+  }
+  return out;
+}
+
+function isComboMenuItemUnavailable(obj: Record<string, unknown>): boolean {
+  const spuType = (asString(obj.spuType) ?? "").toLowerCase();
+  if (spuType !== "combo") {
+    return false;
+  }
+
+  const rawGroups = asArray(obj.comboGroupList) ?? [];
+  if (rawGroups.length > 0) {
+    for (const rawGroup of rawGroups) {
+      if (!rawGroup || typeof rawGroup !== "object") {
+        continue;
+      }
+      const groupObj = rawGroup as Record<string, unknown>;
+      const rawChoices =
+        asArray(groupObj.comboGroupSkuList) ?? asArray(groupObj.comboSkuList) ?? asArray(groupObj.skuList) ?? [];
+      if (rawChoices.length === 0) {
+        continue;
+      }
+      const availableCount = rawChoices.reduce<number>((acc, rawChoice) => {
+        if (!rawChoice || typeof rawChoice !== "object") {
+          return acc;
+        }
+        return isMenuItemOutOfStock(rawChoice as Record<string, unknown>) ? acc : acc + 1;
+      }, 0);
+      const quantity = Math.max(0, Math.floor(toNum(groupObj.quantity) ?? 1));
+      const required =
+        toBool(groupObj.required) === true ||
+        (asString(groupObj.groupType) ?? "").toLowerCase() === "must" ||
+        quantity > 0;
+      if (required && availableCount === 0) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  const rawFixed = asArray(obj.comboSkuList) ?? [];
+  if (rawFixed.length === 0) {
+    return false;
+  }
+  const availableCount = rawFixed.reduce<number>((acc, rawComponent) => {
+    if (!rawComponent || typeof rawComponent !== "object") {
+      return acc;
+    }
+    return isMenuItemOutOfStock(rawComponent as Record<string, unknown>) ? acc : acc + 1;
+  }, 0);
+  if (availableCount === 0) {
+    return true;
+  }
+  return availableCount < rawFixed.length;
 }
 
 interface SpuAttributeOptionChoice {
