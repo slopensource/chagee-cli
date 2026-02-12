@@ -375,6 +375,14 @@ function TuiRoot(props: TuiRootProps): React.JSX.Element {
           return;
         }
 
+        const commandRoot = (command.split(/\s+/, 1)[0] ?? "").toLowerCase();
+        if (commandRoot === "pay" && mouseEnabled) {
+          setMouseEnabled(false);
+          pushLog(
+            "mouse capture AUTO-OFF for /pay (native text selection/copy enabled; run /mouse on to re-enable click navigation)"
+          );
+        }
+
         setBusy(true);
         pushLog(`${source === "shell" ? "cmd" : source} > /${command}`);
         try {
