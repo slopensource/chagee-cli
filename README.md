@@ -29,6 +29,7 @@ This README is split into two tracks:
 - [Usage Command Reference](#usage-command-reference)
 - [Session and Prompt States](#session-and-prompt-states)
 - [Troubleshooting (Usage)](#troubleshooting-usage)
+- [FAQ](#faq)
 - [Example Session Transcript](#example-session-transcript)
 - [Non-Interactive Usage](#non-interactive-usage)
 - [Developing chagee-cli](#developing-chagee-cli)
@@ -47,6 +48,7 @@ This README is split into two tracks:
 - Extensible regions: yes (via custom region profiles)
 - Fulfillment: pickup only
 - Delivery: not implemented
+- Discounts/promotions: not implemented yet
 - Default mode: `dry-run` (safe; `place` will not submit real order)
 
 ## Using the CLI
@@ -180,9 +182,9 @@ Notes:
 - `Up` / `Down` in `console`: scroll logs when input is empty, history when typing
 - `Enter (console pane)`: run typed slash command
 - `Enter (stores pane)`: run `use <storeNo>`
-- `Enter (menu pane)`: open variant/customization picker, then `Enter` again to add
+- `Enter (menu pane)`: open staged variant/customization picker; `Enter` advances stage and adds on final stage
 - `Left` / `Right` (menu variant picker): adjust quantity before add
-- `Esc` (menu variant picker): close picker
+- `Esc` (menu variant picker): go back one stage; closes picker from first stage
 - `Enter (cart pane)`: increment selected line qty (`qty`)
 - `Left` / `-` (cart pane): decrease selected line qty
 - `Right` / `+` (cart pane): increase selected line qty
@@ -440,6 +442,33 @@ Phases:
 7. Need reset: delete `~/.chagee-cli/session.json` and restart.
 8. Need payloads: run `debug last-req`, `debug last-res`, `debug events`.
 9. Browser auto-login cannot find a debuggable tab: ensure browser is started with remote debugging and `h5.chagee.com.sg` is open.
+
+### FAQ
+
+1. Where do drink customization options (size/ice/sweetness) come from?
+   From API data (`item` / goods detail response). The TUI does not hardcode these options.
+2. Why do different drinks show different customization steps?
+   Each product has its own option groups in API payloads. If a drink has fewer groups, fewer stages are shown.
+3. What is the staged picker order?
+   The picker prioritizes `Variant/Size` first, then `Ice`, then `Sweetness`, then other groups.
+4. How do I use the staged picker quickly?
+   `Up/Down` selects a value, `Enter` moves to next stage (or adds on final stage), `Esc` moves back, `+/-` adjusts quantity.
+5. Why are long lines wrapped in the picker?
+   To avoid hiding information. The footer now wraps lines instead of truncating with `...`.
+6. Do I need an order number to cancel an order?
+   Not in normal flow. `order cancel` targets the latest order in current session state.
+7. Is there a cancellation time limit?
+   Yes. Use `order show` to inspect `cancelByAt` and `cancelRemainingSec` (when returned by API).
+8. Do discounts/promo codes/member vouchers work?
+   Not currently. This CLI does not apply or manage discounts right now.
+9. Why do you want to do this?
+   Because I am extra.
+10. Are you trying to scam me?
+   Nope. I'm using this for my own use. Use it at your own risk but I am not trying to scam you.
+11. Is this stable for production usage?
+   No. This project is alpha and highly experimental; use at your own risk.
+12. Is this code AI-generated?
+   Yes. Every line of code in this repository is written by AI.
 
 ### Example Session Transcript
 
