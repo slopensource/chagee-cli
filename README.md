@@ -398,7 +398,8 @@ You can prefix any command with `/` (example: `/status`).
 SAFE shell mode (default):
 
 - These shell commands require startup flag `--yolo`:
-  `use`, `wait`, `menu`, `item`, `cart`, `add`, `qty`, `rm`, `clear`, `quote`, `live on|off`, `place`, `checkout`, `confirm`, `pay`, `order cancel`, `pay start`, `pay open` (including legacy `store use|wait`).
+  `use`, `wait`, `menu`, `item`, `cart`, `add`, `qty`, `rm`, `clear`, `quote`, `live on|off`, `place`, `checkout`, `confirm`, `order cancel`, `pay start`, `pay open` (including legacy `store use|wait`).
+- `pay` (guided) is allowed in SAFE shell when cart/order/payment context exists.
 - Panel-driven ordering in TUI remains available without `--yolo`.
 
 Simple flow commands:
