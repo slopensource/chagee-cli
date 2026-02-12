@@ -23,6 +23,11 @@ interface MenuRow {
   item: MenuItem;
 }
 
+interface MenuPaneView {
+  lines: string[];
+  visibleItemIndices: Array<number | undefined>;
+}
+
 interface MenuVariantPickerState {
   row: MenuRow;
   options: ItemSkuOption[];
@@ -76,6 +81,7 @@ interface MouseContext {
   focusPane: FocusPane;
   storesLen: number;
   menuLen: number;
+  menuVisibleItemIndices: Array<number | undefined>;
   menuVariantFooterRows: number;
   cartLen: number;
   cartVisibleRows: number;
@@ -265,6 +271,18 @@ function TuiRoot(props: TuiRootProps): React.JSX.Element {
 
   const stores = appState?.storesCache ?? [];
   const menuRows = useMemo(() => flattenMenuRows(appState?.menuCache ?? []), [appState?.menuCache]);
+  const paneBodyMaxLines = Math.max(1, layout.paneHeight - 2);
+  const menuPaneView = useMemo(
+    () =>
+      buildMenuPaneLines(
+        menuRows,
+        menuIndex,
+        focusPane === "menu",
+        menuPaneTextWidth,
+        paneBodyMaxLines
+      ),
+    [focusPane, menuIndex, menuPaneTextWidth, menuRows, paneBodyMaxLines]
+  );
   const cartLines = appState?.cart ?? [];
   const phase: AppPhase = appState ? derivePhase(appState) : "UNAUTH";
   const slashHints = useMemo(
@@ -281,6 +299,7 @@ function TuiRoot(props: TuiRootProps): React.JSX.Element {
     focusPane,
     storesLen: stores.length,
     menuLen: menuRows.length,
+    menuVisibleItemIndices: [],
     menuVariantFooterRows: 0,
     cartLen: cartLines.length,
     cartVisibleRows: 0,
@@ -328,6 +347,12 @@ function TuiRoot(props: TuiRootProps): React.JSX.Element {
     [pushLog]
   );
 
+  const disableMouseCaptureNow = useCallback((): void => {
+    if (stdout.isTTY) {
+      stdout.write(DISABLE_MOUSE);
+    }
+  }, [stdout]);
+
   const executeCommand = useCallback(
     (raw: string, source: TuiCommandSource = "shell"): void => {
       enqueue(async () => {
@@ -366,6 +391,7 @@ function TuiRoot(props: TuiRootProps): React.JSX.Element {
           return;
         }
         if (command === "mouse off") {
+          disableMouseCaptureNow();
           setMouseEnabled(false);
           pushLog("mouse capture OFF (native text selection/copy enabled)");
           return;
@@ -377,6 +403,7 @@ function TuiRoot(props: TuiRootProps): React.JSX.Element {
 
         const commandRoot = (command.split(/\s+/, 1)[0] ?? "").toLowerCase();
         if (commandRoot === "pay" && mouseEnabled) {
+          disableMouseCaptureNow();
           setMouseEnabled(false);
           pushLog(
             "mouse capture AUTO-OFF for /pay (native text selection/copy enabled; run /mouse on to re-enable click navigation)"
@@ -412,7 +439,7 @@ function TuiRoot(props: TuiRootProps): React.JSX.Element {
         }
       });
     },
-    [enqueue, mouseEnabled, pushLog, refreshSnapshot, stopApp]
+    [disableMouseCaptureNow, enqueue, mouseEnabled, pushLog, refreshSnapshot, stopApp]
   );
 
   const focusCycle = useCallback(
@@ -537,6 +564,18 @@ function TuiRoot(props: TuiRootProps): React.JSX.Element {
     [cartLines, executeCommand, menuRows, menuVariantPicker, openMenuVariantPicker, stores]
   );
 
+  const activateConsolePointerIntent = useCallback((): void => {
+    setFocusPane("console");
+    if (!mouseEnabled) {
+      return;
+    }
+    disableMouseCaptureNow();
+    setMouseEnabled(false);
+    pushLog(
+      "mouse capture AUTO-OFF in shell area (drag again to select/copy; run /mouse on to re-enable click navigation)"
+    );
+  }, [disableMouseCaptureNow, mouseEnabled, pushLog]);
+
   useEffect(() => {
     let cancelled = false;
     void (async () => {
@@ -550,7 +589,9 @@ function TuiRoot(props: TuiRootProps): React.JSX.Element {
       if (!props.yolo) {
         pushLog("SAFE shell mode: ordering slash commands are disabled. Use panels or restart with --yolo.");
       }
-      pushLog("mouse capture ON (click navigation enabled; run /mouse off for text selection)");
+      pushLog(
+        "mouse capture ON (click navigation enabled; click shell once to auto-enable text selection mode)"
+      );
     })();
     return () => {
       cancelled = true;
@@ -729,6 +770,7 @@ function TuiRoot(props: TuiRootProps): React.JSX.Element {
       focusPane,
       storesLen: stores.length,
       menuLen: activeMenuLen,
+      menuVisibleItemIndices: menuVariantPicker ? [] : menuPaneView.visibleItemIndices,
       menuVariantFooterRows,
       cartLen: cartLines.length,
       cartVisibleRows,
@@ -745,6 +787,7 @@ function TuiRoot(props: TuiRootProps): React.JSX.Element {
     menuIndex,
     menuRows.length,
     menuVariantPicker,
+    menuPaneView,
     cartPaneTextWidth,
     menuPaneTextWidth,
     storeIndex,
@@ -779,7 +822,8 @@ function TuiRoot(props: TuiRootProps): React.JSX.Element {
           setCartIndex,
           setMenuVariantPicker,
           lastMouseClickRef,
-          activateMouseSelection
+          activateMouseSelection,
+          activateConsolePointerIntent
         );
       }
     };
@@ -789,7 +833,16 @@ function TuiRoot(props: TuiRootProps): React.JSX.Element {
       stdin.off("data", onData);
       stdout.write(DISABLE_MOUSE);
     };
-  }, [activateMouseSelection, isRawModeSupported, mouseEnabled, ready, setRawMode, stdin, stdout]);
+  }, [
+    activateConsolePointerIntent,
+    activateMouseSelection,
+    isRawModeSupported,
+    mouseEnabled,
+    ready,
+    setRawMode,
+    stdin,
+    stdout
+  ]);
 
   useInput((input, key) => {
     if (key.ctrl && input === "c") {
@@ -1057,15 +1110,9 @@ function TuiRoot(props: TuiRootProps): React.JSX.Element {
         menuVariantPicker,
         focusPane === "menu",
         menuPaneTextWidth,
-        Math.max(1, layout.paneHeight - 2)
+        paneBodyMaxLines
       )
-    : buildMenuPaneLines(
-        menuRows,
-        menuIndex,
-        focusPane === "menu",
-        menuPaneTextWidth,
-        Math.max(1, layout.paneHeight - 2)
-      );
+    : menuPaneView.lines;
   const cartPaneLines = buildCartPaneLines(
     cartLines,
     cartIndex,
@@ -1099,7 +1146,7 @@ function TuiRoot(props: TuiRootProps): React.JSX.Element {
       </Box>
       <Text color="gray">
         {mouseEnabled
-          ? "Slash shell: type `/` to focus input, Enter to run, Tab to cycle panes, click to select."
+          ? "Slash shell: type `/` to focus input, Enter to run, Tab to cycle panes, click to select. Click shell once to unlock native text selection."
           : "Slash shell: type `/` to focus input, Enter to run, Tab to cycle panes. Run `/mouse on` for click pane navigation."}
       </Text>
 
@@ -1425,45 +1472,84 @@ function buildMenuPaneLines(
   focused: boolean,
   width: number,
   maxLines: number
-): string[] {
-  const sectionWidth = Math.max(12, Math.min(28, Math.floor(width * 0.38)));
-  const itemWidth = Math.max(8, width - sectionWidth - 3);
+): MenuPaneView {
+  const headerPrefix = "  ";
+  const itemPrefix = "    ";
+  const headerTextWidth = Math.max(8, width - headerPrefix.length);
+  const itemWidth = Math.max(8, width - itemPrefix.length);
   const visibleRows = Math.max(0, maxLines - 3);
-  const start = windowStart(menuIndex, menuRows.length, visibleRows);
-  const end = Math.min(menuRows.length, start + visibleRows);
   const divider = "-".repeat(Math.max(1, width - 2));
-  const uniqueSections = new Set(
+  const sectionCount = new Set(
     menuRows.map((row) => row.categoryName.trim().toLowerCase()).filter((name) => name.length > 0)
   ).size;
   const lines = [
-    `${focused ? "›" : " "} MENU (${menuRows.length}/${uniqueSections})`,
-    `  ${fit("Section", sectionWidth)} ${fit("Item", itemWidth)}`,
-    `  ${divider}`
+    `${focused ? "›" : " "} MENU (${menuRows.length}/${sectionCount})`,
+    `${headerPrefix}${fit("Item", headerTextWidth)}`,
+    `${headerPrefix}${divider}`
   ];
-  for (let i = start; i < end; i += 1) {
+
+  const displayRows: Array<{ itemIndex?: number; text: string; isHeader: boolean }> = [];
+  let currentSectionKey = "";
+  for (let i = 0; i < menuRows.length; i += 1) {
     const row = menuRows[i];
     if (!row) {
       continue;
     }
-    const isActive = focused && i === menuIndex;
-    const categoryName = fit(row.categoryName || "-", sectionWidth);
-    const itemName = fit(row.item.name, itemWidth);
+    const sectionName = row.categoryName.trim() || "Other";
+    const sectionKey = sectionName.toLowerCase();
+    if (sectionKey !== currentSectionKey) {
+      currentSectionKey = sectionKey;
+      displayRows.push({
+        text: `[${sectionName}]`,
+        isHeader: true
+      });
+    }
+    displayRows.push({
+      itemIndex: i,
+      text: row.item.name,
+      isHeader: false
+    });
+  }
+
+  const selectedItemIndex = clampIndex(menuIndex, menuRows.length);
+  const selectedDisplayIndex = Math.max(
+    0,
+    displayRows.findIndex((entry) => entry.itemIndex === selectedItemIndex)
+  );
+  let start = windowStart(selectedDisplayIndex, displayRows.length, visibleRows);
+  if (displayRows[start] && !displayRows[start]?.isHeader) {
+    let headerIdx = start;
+    while (headerIdx > 0 && !displayRows[headerIdx]?.isHeader) {
+      headerIdx -= 1;
+    }
+    if (displayRows[headerIdx]?.isHeader && selectedDisplayIndex - headerIdx < visibleRows) {
+      start = headerIdx;
+    }
+  }
+
+  const visibleItemIndices: Array<number | undefined> = [];
+  for (let slot = 0; slot < visibleRows; slot += 1) {
+    const entry = displayRows[start + slot];
+    if (!entry) {
+      visibleItemIndices.push(undefined);
+      lines.push(itemPrefix);
+      continue;
+    }
+    if (entry.isHeader) {
+      visibleItemIndices.push(undefined);
+      lines.push(`${LINE_SELECTED}${headerPrefix}${fit(entry.text, headerTextWidth)}`);
+      continue;
+    }
+    const isActive = focused && entry.itemIndex === menuIndex;
     const flags = isActive ? LINE_ACTIVE : "";
-    lines.push(`${flags}  ${categoryName} ${itemName}`);
+    visibleItemIndices.push(entry.itemIndex);
+    lines.push(`${flags}${itemPrefix}${fit(entry.text, itemWidth)}`);
   }
-  if (start > 0 && lines.length > 1) {
-    const header = lines[1];
-    if (header) {
-      lines[1] = `↑ ${header.slice(2)}`;
-    }
-  }
-  if (end < menuRows.length && lines.length > 0) {
-    const last = lines[lines.length - 1];
-    if (last) {
-      lines[lines.length - 1] = `↓${last.slice(1)}`;
-    }
-  }
-  return lines;
+
+  return {
+    lines,
+    visibleItemIndices
+  };
 }
 
 function buildMenuVariantPaneLines(
@@ -2140,13 +2226,15 @@ function handleMouseEvent(
   setCartIndex: (updater: (prev: number) => number) => void,
   setMenuVariantPicker: React.Dispatch<React.SetStateAction<MenuVariantPickerState | undefined>>,
   lastMouseClickRef: React.MutableRefObject<LastMouseClick | undefined>,
-  onDoubleClickSelection: (selection: MouseRowSelection) => void
+  onDoubleClickSelection: (selection: MouseRowSelection) => void,
+  onConsolePointerIntent: () => void
 ): void {
   const {
     layout,
     terminalCols,
     storesLen,
     menuLen,
+    menuVisibleItemIndices,
     menuVariantFooterRows,
     cartLen,
     cartVisibleRows,
@@ -2196,7 +2284,15 @@ function handleMouseEvent(
       const visibleRows = menuVariantOpen
         ? Math.max(0, paneBodyLines - (3 + variantFooterRows))
         : Math.max(0, paneBodyLines - 3);
-      const idx = resolveClickedIndex(event.y, dataStartY, menuIndex, menuLen, visibleRows);
+      let idx: number | undefined;
+      if (menuVariantOpen) {
+        idx = resolveClickedIndex(event.y, dataStartY, menuIndex, menuLen, visibleRows);
+      } else {
+        const rowOffset = event.y - dataStartY;
+        if (rowOffset >= 0 && rowOffset < menuVisibleItemIndices.length) {
+          idx = menuVisibleItemIndices[rowOffset];
+        }
+      }
       if (idx !== undefined) {
         if (menuVariantOpen) {
           setMenuVariantPicker((prev) => {
@@ -2230,7 +2326,7 @@ function handleMouseEvent(
   }
 
   if (event.y >= layout.consoleStart && event.y <= layout.consoleEnd) {
-    setFocusPane("console");
+    onConsolePointerIntent();
   }
 }
 
