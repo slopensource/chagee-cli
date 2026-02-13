@@ -1010,7 +1010,8 @@ function TuiRoot(props: TuiRootProps): React.JSX.Element {
       return;
     }
 
-    if (key.escape) {
+    const backNavigationRequested = focusPane === "menu" && Boolean(menuVariantPicker) && key.backspace;
+    if (key.escape || backNavigationRequested) {
       if (focusPane === "menu" && menuVariantPicker) {
         setMenuVariantPicker((prev) => {
           if (!prev) {
@@ -1235,7 +1236,7 @@ function Pane(props: PaneProps): React.JSX.Element {
         const trimmed = line.trim();
         const isPaneTitle = idx === 0;
         const isColumnHeader = idx === 1;
-        const isDivider = idx === 2 && /^-+$/.test(trimmed);
+        const isDivider = /^[-─]+$/.test(trimmed);
         const color = isActive
           ? "black"
           : isPaneTitle
@@ -1446,7 +1447,9 @@ function buildMenuPaneLines(
   const itemPrefix = "    ";
   const headerTextWidth = Math.max(8, width - headerPrefix.length);
   const itemWidth = Math.max(8, width - itemPrefix.length);
-  const visibleRows = Math.max(0, maxLines - 3);
+  const footerBlock = wrapPaneLine(`${LINE_SELECTED}Keys: ↑↓ select  ↵ customize`, width);
+  const bodyMaxLines = Math.max(0, maxLines - footerBlock.length);
+  const visibleRows = Math.max(0, bodyMaxLines - 3);
   const divider = "-".repeat(Math.max(1, width - 2));
   const sectionCount = new Set(
     menuRows.map((row) => row.categoryName.trim().toLowerCase()).filter((name) => name.length > 0)
@@ -1516,7 +1519,7 @@ function buildMenuPaneLines(
   }
 
   return {
-    lines,
+    lines: [...lines, LINE_FOOTER_SPLIT, ...footerBlock],
     visibleItemIndices
   };
 }
@@ -1610,12 +1613,22 @@ function buildCartPaneLines(
     }
   }
 
-  const adjustHintRows = cart.length > 0 ? 1 : 0;
-  const detailContentRows = Math.min(detailLinesAll.length, Math.max(0, CART_DETAIL_ROWS - adjustHintRows));
+  const hintLines =
+    cart.length > 0
+      ? wrapPaneLine(
+          `${LINE_SELECTED}Keys: ↑↓ select  ←→ qty  ↵ +1  Del/x remove`,
+          width
+        )
+      : [];
+  const separatorRows = 1;
+  const reservedRows = hintLines.length + separatorRows;
+  const detailContentRows = Math.min(
+    detailLinesAll.length,
+    Math.max(0, CART_DETAIL_ROWS - reservedRows)
+  );
   const detailBlock: string[] = [...detailLinesAll.slice(0, detailContentRows)];
-  if (cart.length > 0) {
-    detailBlock.push("←→ qty  Del rm");
-  }
+  detailBlock.push(...hintLines);
+  detailBlock.push(`  ${divider}`);
 
   // Keep the options/detail area visually anchored above totals.
   const spacerRows = Math.max(0, bodyCapacity - (bodyLines.length + detailBlock.length));
@@ -1648,14 +1661,14 @@ function buildCartDetailLinesAll(
   const lines: string[] = [];
 
   if (!selected) {
-    lines.push(...wrapPaneLine("Options: -", contentWidth));
+    lines.push(...wrapPaneLine(`${LINE_SELECTED}Options: -`, contentWidth));
   } else {
     const rawSegments = (selected.variantText ?? "")
       .split("|")
       .map((part) => part.trim())
       .filter((part) => part.length > 0);
 
-    lines.push(...wrapPaneLine(`Options (Item ${cartIndex + 1}):`, contentWidth));
+    lines.push(...wrapPaneLine(`${LINE_SELECTED}Options (Item ${cartIndex + 1}):`, contentWidth));
 
     if (rawSegments.length === 0) {
       if ((selected.specList?.length ?? 0) > 0 || (selected.attributeList?.length ?? 0) > 0) {
@@ -2105,7 +2118,8 @@ function buildMenuVariantFooterLines(picker: MenuVariantPickerState, width: numb
     lines.push(` ${dimension.label}: ${picker.selectedValues[i] ?? "?"}${marker}`);
   }
 
-  lines.push(`↑↓ select  ↵ ${actionVerb}  Esc ${escAction}  ±qty: ${picker.qty}`);
+  lines.push(`${LINE_SELECTED}Keys: ↑↓ select  ↵ ${actionVerb}  Esc/Backspace ${escAction}`);
+  lines.push(`${LINE_SELECTED}Qty: ←→ or +/-  (now ${picker.qty})`);
 
   return lines.flatMap((line) => wrapPaneLine(line, width));
 }
