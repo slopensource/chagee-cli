@@ -176,7 +176,6 @@ const SHELL_ORDERING_ROOTS = new Set([
   "qty",
   "rm",
   "clear",
-  "quote",
   "place",
   "checkout",
   "confirm",
@@ -561,7 +560,9 @@ function TuiRoot(props: TuiRootProps): React.JSX.Element {
       setReady(true);
       pushLog("Ready. Type /help.");
       if (!props.yolo) {
-        pushLog("SAFE shell mode: ordering slash commands are disabled. Use panels or restart with --yolo.");
+        pushLog(
+          "SAFE shell mode: most ordering slash commands are disabled (but /quote is allowed). Use panels or restart with --yolo."
+        );
       }
       pushLog("Keyboard-only panel navigation enabled. Mouse is reserved for native text selection/copy.");
     })();

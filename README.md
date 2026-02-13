@@ -217,7 +217,7 @@ Layout:
 Console notes:
 
 - Slash commands are supported (`/login`, `/otp`, `/stores`, `/status`, etc.).
-- SAFE shell mode is default: ordering commands in shell are blocked unless app was started with `--yolo`.
+- SAFE shell mode is default: most ordering commands in shell are blocked unless app was started with `--yolo` (exception: `/quote` is allowed).
 - Panel interactions still allow ordering flow in SAFE mode.
 - Mouse click capture is enabled by default for pane navigation.
 - Use `/mouse off` if you want native terminal text selection/copy behavior.
@@ -398,7 +398,7 @@ You can prefix any command with `/` (example: `/status`).
 SAFE shell mode (default):
 
 - These shell commands require startup flag `--yolo`:
-  `use`, `wait`, `menu`, `item`, `cart`, `add`, `qty`, `rm`, `clear`, `quote`, `live on|off`, `place`, `checkout`, `confirm`, `order cancel`, `pay start`, `pay open` (including legacy `store use|wait`).
+  `use`, `wait`, `menu`, `item`, `cart`, `add`, `qty`, `rm`, `clear`, `live on|off`, `place`, `checkout`, `confirm`, `order cancel`, `pay start`, `pay open` (including legacy `store use|wait`).
 - `pay` (guided) is allowed in SAFE shell when cart/order/payment context exists.
 - Panel-driven ordering in TUI remains available without `--yolo`.
 

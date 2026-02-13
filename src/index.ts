@@ -49,7 +49,7 @@ import type {
 const HELP = `CHAGEE CLI (simple mode)
   Tip: slash prefix is accepted (example: /status)
   Warning: alpha + highly experimental; use at your own risk.
-  Safe shell mode blocks ordering commands unless launched with --yolo.
+  Safe shell mode blocks most ordering commands unless launched with --yolo.
 
   help
   status
@@ -105,6 +105,7 @@ const SAFE_HELP = `CHAGEE CLI (simple mode)
   stores [sort=distance|wait|cups|name] [lat=1.35] [lng=103.81]
   watch on|off [interval=10] [sort=distance|wait|cups|name] [quiet=1]
 
+  quote  (requires login + cart context)
   order [show]
   pay [open=1] [channelCode=H5] [payType=1]  (guided; requires cart/order context)
   pay [status]
@@ -302,7 +303,7 @@ export class App {
     } else {
       console.log(
         colorText(
-          "shell mode: SAFE (ordering commands disabled; relaunch with --yolo)",
+          "shell mode: SAFE (most ordering commands disabled; relaunch with --yolo)",
           ANSI_BRIGHT_MAGENTA,
           colorsEnabled
         )
@@ -2929,7 +2930,6 @@ export class App {
         "rm",
         "clear",
         "cart",
-        "quote",
         "place",
         "checkout",
         "confirm",
