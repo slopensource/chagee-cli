@@ -222,6 +222,7 @@ Console notes:
 - Mouse click capture is enabled by default for pane navigation.
 - Use `/mouse off` if you want native terminal text selection/copy behavior.
 - Store capacity auto-refresh starts on launch (`/watch on interval=10 sort=distance quiet=1`).
+- Payment status auto-polling runs every 5s while an order payment is pending.
 - Location is validated on startup via IP geolocation for `default/ip` sessions. Browser/manual coordinates are preserved.
 - Distance heartbeat: backend re-checks IP geolocation every ~60s during store refresh for non-manual/non-browser sessions.
 - For higher precision, run `/locate` (browser geolocation) or set manually with:
@@ -432,6 +433,7 @@ Simple flow commands:
 - `order [show|cancel [force=1]]`
 - `pay [open=1] [channelCode=H5] [payType=1]` (guided)
 - `pay [status|open|start]`
+- `pay status` remains available for on-demand checks; polling updates status automatically while pending.
 
 Cancel window notes:
 

@@ -84,6 +84,7 @@ const HELP = `CHAGEE CLI (simple mode)
   order [show|cancel]
   pay [open=1] [channelCode=H5] [payType=1]  (guided)
   pay [status|open|start]
+  payment status auto-polls every 5s while pending.
 
   debug help`;
 
@@ -109,6 +110,7 @@ const SAFE_HELP = `CHAGEE CLI (simple mode)
   order [show]
   pay [open=1] [channelCode=H5] [payType=1]  (guided; requires cart/order context)
   pay [status]
+  payment status auto-polls every 5s while pending.
 
   debug help`;
 
@@ -155,6 +157,8 @@ interface BrowserTokenCaptureResult {
 const LOCATION_SOURCES: readonly LocationSource[] = ["default", "ip", "browser", "manual"];
 const LOCATION_HEARTBEAT_MS = 60 * 1000;
 const LOCATION_CHANGE_EPSILON = 0.000001;
+const PAYMENT_STATUS_POLL_MS = 5 * 1000;
+const PAYMENT_STATUS_ERROR_LOG_THROTTLE_MS = 30 * 1000;
 const ITEM_OPTION_PRINT_LIMIT = 24;
 
 export class App {
@@ -170,6 +174,9 @@ export class App {
   private storesWatchBusy = false;
   private storesWatchSilent = false;
   private storesWatchSort: StoreSort = "distance";
+  private paymentStatusPollTimer: NodeJS.Timeout | undefined;
+  private paymentStatusPollBusy = false;
+  private lastPaymentStatusPollErrorAtMs = 0;
   private itemSkuOptionsCacheByStore: Record<string, Record<string, ItemSkuOption[]>> = {};
   private lastLocationHeartbeatAttemptAtMs = 0;
   private readonly yoloMode: boolean;
@@ -243,6 +250,7 @@ export class App {
         // Keep startup resilient if menu prefetch fails.
       }
     }
+    this.reconcilePaymentStatusPolling();
   }
 
   async run(): Promise<void> {
@@ -261,7 +269,7 @@ export class App {
           if (trimmed.length === 0) {
             continue;
           }
-          const shouldExit = await this.handle(trimmed);
+          const shouldExit = await this.dispatch(trimmed, "shell");
           if (shouldExit) {
             break;
           }
@@ -283,13 +291,14 @@ export class App {
         }
 
         this.echoShellCommand(trimmed, colorsEnabled);
-        const shouldExit = await this.handle(trimmed);
+        const shouldExit = await this.dispatch(trimmed, "shell");
         if (shouldExit) {
           break;
         }
       }
     } finally {
       this.stopStoreWatch();
+      this.stopPaymentStatusPolling();
       rl.close();
       restoreOutputColors();
     }
@@ -527,7 +536,8 @@ export class App {
       cartVersion: this.state.cartVersion,
       quoteAt: this.state.quote?.at,
       orderNo: this.state.order?.orderNo,
-      paymentStatus: this.state.payment?.status
+      paymentStatus: this.state.payment?.status,
+      paymentPolling: this.paymentStatusPollTimer ? "on" : "off"
     };
 
     this.printData(summary);
@@ -2104,47 +2114,92 @@ export class App {
     }
 
     if (action === "status") {
-      if (!this.state.auth) {
-        console.log("Login required. Run `login` first.");
-        return;
-      }
-      if (!this.state.selectedStore) {
-        console.log("Select a store first.");
-        return;
-      }
-      if (!this.state.order?.orderNo) {
-        console.log("No order found in session.");
-        console.log("Run `pay` to create/open payment, then `pay status`.");
-        return;
-      }
-      const res = await this.client.payResultList({
-        userId: this.state.auth.userId,
-        storeNo: this.state.selectedStore.storeNo,
-        orderNo: this.state.order.orderNo
-      });
-      this.printEnvelope(res);
-      if (isApiOk(res)) {
-        const data = envelopeData(res);
-        const statuses = extractPayStatuses(data);
-        if (statuses.includes(2)) {
-          if (this.state.order) {
-            this.state.order.status = "paid";
-          }
-          if (this.state.payment) {
-            this.state.payment.status = "success";
-          }
-          await this.persist();
-          console.log("Payment status: SUCCESS");
-        } else if (statuses.includes(1) || statuses.includes(0)) {
-          console.log("Payment status: PENDING");
-        } else {
-          console.log(`Payment statuses: [${statuses.join(", ")}]`);
-        }
-      }
+      await this.refreshPaymentStatus("manual");
       return;
     }
 
     console.log("Usage: pay [open=1] [channelCode=H5] [payType=1] | pay [status|open|start]");
+  }
+
+  private async refreshPaymentStatus(source: "manual" | "auto"): Promise<void> {
+    if (!this.state.auth) {
+      if (source === "manual") {
+        console.log("Login required. Run `login` first.");
+      }
+      return;
+    }
+    if (!this.state.selectedStore) {
+      if (source === "manual") {
+        console.log("Select a store first.");
+      }
+      return;
+    }
+    if (!this.state.order?.orderNo) {
+      if (source === "manual") {
+        console.log("No order found in session.");
+        console.log("Run `pay` to create/open payment, then `pay status`.");
+      }
+      return;
+    }
+
+    const res = await this.client.payResultList({
+      userId: this.state.auth.userId,
+      storeNo: this.state.selectedStore.storeNo,
+      orderNo: this.state.order.orderNo
+    });
+    if (source === "manual") {
+      this.printEnvelope(res);
+    }
+    if (!isApiOk(res)) {
+      return;
+    }
+
+    const data = envelopeData(res);
+    const statuses = extractPayStatuses(data);
+    if (statuses.includes(2)) {
+      const previousOrderStatus = this.state.order?.status;
+      const previousPaymentStatus = this.state.payment?.status;
+      if (this.state.order) {
+        this.state.order.status = "paid";
+      }
+      if (!this.state.payment) {
+        this.state.payment = { status: "success" };
+      } else {
+        this.state.payment.status = "success";
+      }
+      const changed =
+        previousOrderStatus !== this.state.order?.status ||
+        previousPaymentStatus !== this.state.payment?.status;
+      if (changed) {
+        await this.persist();
+      }
+      if (source === "manual" || changed) {
+        console.log(`Payment status: SUCCESS${source === "auto" ? " (auto)" : ""}`);
+      }
+      return;
+    }
+
+    if (statuses.includes(1) || statuses.includes(0)) {
+      let changed = false;
+      if (!this.state.payment) {
+        this.state.payment = { status: "pending" };
+        changed = true;
+      } else if (this.state.payment.status !== "pending") {
+        this.state.payment.status = "pending";
+        changed = true;
+      }
+      if (changed) {
+        await this.persist();
+      }
+      if (source === "manual") {
+        console.log("Payment status: PENDING");
+      }
+      return;
+    }
+
+    if (source === "manual") {
+      console.log(`Payment statuses: [${statuses.join(", ")}]`);
+    }
   }
 
   private async cmdPayGuided(rest: string[]): Promise<void> {
@@ -2319,6 +2374,69 @@ export class App {
     }
     this.storesWatchSilent = false;
     this.storesWatchSort = "distance";
+  }
+
+  private shouldPollPaymentStatus(): boolean {
+    if (!this.state.auth || !this.state.selectedStore || !this.state.order?.orderNo) {
+      return false;
+    }
+    if (this.state.order.status === "paid" || this.state.order.status === "canceled") {
+      return false;
+    }
+    return this.state.payment?.status === "pending";
+  }
+
+  private reconcilePaymentStatusPolling(): void {
+    if (this.shouldPollPaymentStatus()) {
+      this.startPaymentStatusPolling();
+      return;
+    }
+    this.stopPaymentStatusPolling();
+  }
+
+  private startPaymentStatusPolling(): void {
+    if (this.paymentStatusPollTimer) {
+      return;
+    }
+    this.paymentStatusPollTimer = setInterval(() => {
+      void this.pollPaymentStatus();
+    }, PAYMENT_STATUS_POLL_MS);
+    void this.pollPaymentStatus();
+  }
+
+  private stopPaymentStatusPolling(): void {
+    if (this.paymentStatusPollTimer) {
+      clearInterval(this.paymentStatusPollTimer);
+      this.paymentStatusPollTimer = undefined;
+    }
+    this.paymentStatusPollBusy = false;
+  }
+
+  private async pollPaymentStatus(): Promise<void> {
+    if (!this.shouldPollPaymentStatus()) {
+      this.stopPaymentStatusPolling();
+      return;
+    }
+    if (this.paymentStatusPollBusy) {
+      return;
+    }
+
+    this.paymentStatusPollBusy = true;
+    try {
+      await this.refreshPaymentStatus("auto");
+    } catch (error) {
+      const now = Date.now();
+      if (now - this.lastPaymentStatusPollErrorAtMs >= PAYMENT_STATUS_ERROR_LOG_THROTTLE_MS) {
+        this.lastPaymentStatusPollErrorAtMs = now;
+        const message = error instanceof Error ? error.message : String(error);
+        console.warn(`Payment poll warning: ${message}`);
+      }
+    } finally {
+      this.paymentStatusPollBusy = false;
+      if (!this.shouldPollPaymentStatus()) {
+        this.stopPaymentStatusPolling();
+      }
+    }
   }
 
   private async pollStoresWatch(): Promise<void> {
@@ -2894,8 +3012,14 @@ export class App {
     await saveSession(this.state);
   }
 
+  private async dispatch(raw: string, source: CommandSource): Promise<boolean> {
+    const shouldExit = await this.handle(raw, source);
+    this.reconcilePaymentStatusPolling();
+    return shouldExit;
+  }
+
   async execute(raw: string, options: ExecuteOptions = {}): Promise<boolean> {
-    return this.handle(raw, options.source ?? "shell");
+    return this.dispatch(raw, options.source ?? "shell");
   }
 
   stateSnapshot(): AppState {
@@ -2908,6 +3032,7 @@ export class App {
 
   async shutdown(): Promise<void> {
     this.stopStoreWatch();
+    this.stopPaymentStatusPolling();
     if (this.state.cart.length > 0 || this.state.quote || this.state.pendingCreatePayload) {
       this.state.cart = [];
       nextCartVersion(this.state);
