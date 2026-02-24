@@ -33,6 +33,13 @@ import type {
   StartupLocationRecommendation
 } from "./lib/location-policy.js";
 import { loadCustomRegionProfiles, regionFilePath } from "./lib/region-store.js";
+import {
+  appendOrderHistory,
+  clearOrderHistory,
+  loadOrderHistory,
+  orderHistoryFilePath
+} from "./lib/order-history-store.js";
+import type { OrderHistoryEntry, OrderHistoryLine } from "./lib/order-history-store.js";
 import { loadSession, saveSession, sessionFilePath } from "./lib/session-store.js";
 import { clearAuthToken } from "./lib/token-store.js";
 import {
@@ -93,6 +100,8 @@ const HELP = `CHAGEE CLI (simple mode)
   live on|off
   place [open=1] [channelCode=H5] [payType=1]
   order [show|cancel]
+  orders [list|show <ref>|clear]
+  reorder <ref> [append=0] [qty=1]
   pay [open=1] [channelCode=H5] [payType=1]  (guided)
   pay [status|await|open|start]
   payment status auto-polls every 5s while pending.
@@ -120,6 +129,7 @@ const SAFE_HELP = `CHAGEE CLI (simple mode)
 
   quote  (requires login + cart context)
   order [show]
+  orders [list|show <ref>]
   pay [open=1] [channelCode=H5] [payType=1]  (guided; requires cart/order context)
   pay [status|await]
   payment status auto-polls every 5s while pending.
@@ -216,6 +226,7 @@ export class App {
     shouldRunBrowserLocate: false
   };
   private readonly yoloMode: boolean;
+  private orderHistory: OrderHistoryEntry[] = [];
 
   private readonly client = new ChageeClient(
     () => this.state.auth?.token ?? this.state.session.guestToken,
@@ -242,6 +253,7 @@ export class App {
   async init(): Promise<void> {
     const customRegions = await loadCustomRegionProfiles();
     this.regionRegistry = buildRegionRegistry(customRegions);
+    this.orderHistory = await loadOrderHistory();
 
     const loaded = await loadSession();
     for (const warning of loaded.warnings) {
@@ -512,6 +524,12 @@ export class App {
           } else {
             await this.cmdOrder(rest);
           }
+          return false;
+        case "orders":
+          await this.cmdOrders(rest);
+          return false;
+        case "reorder":
+          await this.cmdReorder(rest);
           return false;
         case "pay":
           await this.cmdPay(rest);
@@ -1702,7 +1720,7 @@ export class App {
       const specList = parseSpecSelectionList(parsed.opts.specList);
       const attributeList = parseAttributeSelectionList(parsed.opts.attributeList);
       const line: CartLine = {
-        lineId: `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`,
+        lineId: buildCartLineId(),
         skuId,
         spuId: parsed.opts.spuId,
         name: parsed.opts.name,
@@ -1957,6 +1975,7 @@ export class App {
     this.applyOrderCancelWindow(created);
     this.state.pendingCreatePayload = undefined;
     this.state.payment = undefined;
+    await this.recordOrderInHistory(orderNo);
     await this.persist();
     console.log(`Order created: ${orderNo}`);
 
@@ -2057,6 +2076,7 @@ export class App {
       this.applyOrderCancelWindow(data);
       this.state.pendingCreatePayload = undefined;
       this.state.payment = undefined;
+      await this.recordOrderInHistory(orderNo);
       await this.persist();
       console.log(`Order created: ${orderNo || "(unknown)"}`);
     }
@@ -2101,6 +2121,220 @@ export class App {
     }
 
     console.log("Usage: order | order show | order cancel [force=1]");
+  }
+
+  private async cmdOrders(rest: string[]): Promise<void> {
+    const sub = rest[0];
+
+    if (sub === "list" || sub === undefined) {
+      const parsed = parseKeyValueTokens(sub === "list" ? rest.slice(1) : rest);
+      const limit = clampInt(parseNum(parsed.opts.limit, 10), 1, 50);
+      if (this.orderHistory.length === 0) {
+        console.log("Order history is empty.");
+        console.log(`History file: ${orderHistoryFilePath()}`);
+        return;
+      }
+
+      const rows = this.orderHistory.slice(0, limit).map((entry, idx) => {
+        const totalItems = entry.items.reduce((sum, line) => sum + Math.max(0, line.qty), 0);
+        return [
+          String(idx + 1),
+          entry.at,
+          entry.orderNo,
+          entry.region,
+          entry.storeName ?? entry.storeNo ?? "-",
+          String(totalItems),
+          entry.total ?? "-"
+        ];
+      });
+      printTable(["#", "at", "orderNo", "region", "store", "qty", "total"], rows);
+      if (this.orderHistory.length > limit) {
+        console.log(`Showing ${limit} of ${this.orderHistory.length} entries (use limit=<n>).`);
+      }
+      return;
+    }
+
+    if (sub === "show") {
+      const ref = rest[1];
+      const entry = this.resolveOrderHistoryEntry(ref);
+      if (!entry) {
+        console.log(`Order history entry not found: ${ref ?? "(missing ref)"}`);
+        return;
+      }
+      this.printData(entry);
+      return;
+    }
+
+    if (sub === "clear") {
+      await clearOrderHistory();
+      this.orderHistory = [];
+      console.log("Order history cleared.");
+      return;
+    }
+
+    if (sub === "file") {
+      console.log(orderHistoryFilePath());
+      return;
+    }
+
+    console.log("Usage: orders [list [limit=10]] | orders show <ref> | orders clear | orders file");
+  }
+
+  private async cmdReorder(rest: string[]): Promise<void> {
+    const parsed = parseKeyValueTokens(rest);
+    const ref = parsed.args[0];
+    if (!ref) {
+      console.log("Usage: reorder <ref> [append=0] [qty=1]");
+      console.log("Use `orders` to find refs (index, id, or orderNo).");
+      return;
+    }
+
+    const entry = this.resolveOrderHistoryEntry(ref);
+    if (!entry) {
+      console.log(`Order history entry not found: ${ref}`);
+      return;
+    }
+    if (entry.items.length === 0) {
+      console.log("Order history entry has no items to reorder.");
+      return;
+    }
+
+    let append = parseBool(parsed.opts.append, false);
+    const qtyMultiplier = clampInt(parseNum(parsed.opts.qty, 1), 1, 20);
+
+    const targetRegion = normalizeRegionCode(entry.region);
+    const currentRegion = normalizeRegionCode(this.state.session.region);
+    if (targetRegion !== currentRegion) {
+      console.log(
+        `Warning: history entry region=${targetRegion} differs from current region=${currentRegion}.`
+      );
+    }
+
+    const currentStoreNo = this.state.selectedStore?.storeNo;
+    const targetStoreNo = entry.storeNo;
+    const requiresStoreSwitch = Boolean(targetStoreNo && targetStoreNo !== currentStoreNo);
+    if (requiresStoreSwitch && append) {
+      append = false;
+      console.log("append=1 ignored because reorder switches to a different store.");
+    }
+    if (requiresStoreSwitch && targetStoreNo) {
+      await this.cmdStore(["use", targetStoreNo]);
+    }
+    if (!this.state.selectedStore && !targetStoreNo) {
+      console.log("Select a store first (history entry has no store).");
+      return;
+    }
+
+    const rebuiltLines = this.buildCartLinesFromOrderHistory(entry.items, qtyMultiplier);
+    if (rebuiltLines.length === 0) {
+      console.log("No valid cart lines found in selected history entry.");
+      return;
+    }
+
+    if (!append) {
+      this.state.cart = [];
+    }
+    this.state.cart.push(...rebuiltLines);
+    nextCartVersion(this.state);
+    this.state.order = undefined;
+    this.state.payment = undefined;
+    await this.persist();
+
+    const totalQty = rebuiltLines.reduce((sum, line) => sum + line.qty, 0);
+    const modeText = append ? "Appended" : "Replaced";
+    console.log(
+      `${modeText} cart from order ${entry.orderNo} (${rebuiltLines.length} line(s), ${totalQty} item(s)).`
+    );
+    if (this.state.selectedStore?.storeNo) {
+      console.log(`Active store: ${this.state.selectedStore.storeNo}`);
+    }
+  }
+
+  private buildCartLinesFromOrderHistory(
+    items: OrderHistoryLine[],
+    qtyMultiplier: number
+  ): CartLine[] {
+    const out: CartLine[] = [];
+    for (const item of items) {
+      if (!item.skuId) {
+        continue;
+      }
+      const qty = Math.max(1, Math.floor(item.qty * qtyMultiplier));
+      out.push({
+        lineId: buildCartLineId(),
+        skuId: item.skuId,
+        spuId: item.spuId,
+        name: item.name,
+        variantText: item.variantText,
+        qty,
+        price: item.price,
+        specList: cloneSpecSelections(item.specList),
+        attributeList: cloneAttributeSelections(item.attributeList)
+      });
+    }
+    return out;
+  }
+
+  private resolveOrderHistoryEntry(ref: string | undefined): OrderHistoryEntry | undefined {
+    if (!ref) {
+      return undefined;
+    }
+    const trimmed = ref.trim();
+    if (trimmed.length === 0) {
+      return undefined;
+    }
+
+    if (/^\d+$/.test(trimmed)) {
+      const index = Number.parseInt(trimmed, 10);
+      if (Number.isFinite(index) && index >= 1 && index <= this.orderHistory.length) {
+        return this.orderHistory[index - 1];
+      }
+    }
+
+    return this.orderHistory.find((entry) => entry.id === trimmed || entry.orderNo === trimmed);
+  }
+
+  private async recordOrderInHistory(orderNo: string): Promise<void> {
+    if (!orderNo) {
+      return;
+    }
+    if (this.state.cart.length === 0) {
+      return;
+    }
+
+    const items: OrderHistoryLine[] = this.state.cart
+      .filter((line) => line.qty > 0 && line.skuId.length > 0)
+      .map((line) => ({
+        skuId: line.skuId,
+        spuId: line.spuId,
+        name: line.name,
+        variantText: line.variantText,
+        qty: line.qty,
+        price: line.price,
+        specList: cloneSpecSelections(line.specList),
+        attributeList: cloneAttributeSelections(line.attributeList)
+      }));
+    if (items.length === 0) {
+      return;
+    }
+
+    const entry: OrderHistoryEntry = {
+      id: `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
+      at: new Date().toISOString(),
+      orderNo,
+      region: normalizeRegionCode(this.state.session.region),
+      storeNo: this.state.selectedStore?.storeNo,
+      storeName: this.state.selectedStore?.storeName,
+      total: this.state.quote?.total ?? this.state.order?.amount,
+      items
+    };
+
+    try {
+      this.orderHistory = await appendOrderHistory(entry);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.warn(`Order history warning: ${message}`);
+    }
   }
 
   private async cmdPay(rest: string[]): Promise<void> {
@@ -3440,7 +3674,8 @@ export class App {
         "place",
         "checkout",
         "confirm",
-        "live"
+        "live",
+        "reorder"
       ].includes(cmd)
     ) {
       return true;
@@ -3548,6 +3783,33 @@ function asString(value: unknown): string | undefined {
     return String(value);
   }
   return undefined;
+}
+
+function buildCartLineId(): string {
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+}
+
+function cloneSpecSelections(
+  list: Array<{ specId: string; specOptionId: string }> | undefined
+): Array<{ specId: string; specOptionId: string }> | undefined {
+  if (!list || list.length === 0) {
+    return undefined;
+  }
+  return list.map((entry) => ({
+    specId: entry.specId,
+    specOptionId: entry.specOptionId
+  }));
+}
+
+function cloneAttributeSelections(
+  list: Array<{ attributeOptionId: string }> | undefined
+): Array<{ attributeOptionId: string }> | undefined {
+  if (!list || list.length === 0) {
+    return undefined;
+  }
+  return list.map((entry) => ({
+    attributeOptionId: entry.attributeOptionId
+  }));
 }
 
 function extractStores(data: unknown): StoreState[] {

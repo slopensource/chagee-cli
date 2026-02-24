@@ -163,6 +163,9 @@ const ALL_SLASH_COMMANDS: SlashCommandHint[] = [
   { command: "place", description: "create order from quote/cart" },
   { command: "order", description: "show latest order state" },
   { command: "order cancel", description: "cancel latest order (if allowed)" },
+  { command: "orders", description: "show local successful order history" },
+  { command: "orders show <ref>", description: "inspect one history entry", insert: "orders show " },
+  { command: "reorder <ref>", description: "rebuild cart from order history", insert: "reorder " },
   { command: "pay", description: "guided payment (create/open payment link)" },
   { command: "pay status", description: "check payment status for latest order" },
   { command: "pay await", description: "poll payment status until success/failure/timeout" },
@@ -184,7 +187,8 @@ const SHELL_ORDERING_ROOTS = new Set([
   "place",
   "checkout",
   "confirm",
-  "live"
+  "live",
+  "reorder"
 ]);
 
 function startupLocationAccuracyTip(source: LocationSource | undefined): string | undefined {
