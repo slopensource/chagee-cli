@@ -63,6 +63,7 @@ const HELP = `CHAGEE CLI (simple mode)
 
   help
   status
+  doctor
   exit
 
   login [timeout=120] [cdp=auto|http://127.0.0.1:9222] [open=1] [phone=+6591234567]
@@ -105,6 +106,7 @@ const SAFE_HELP = `CHAGEE CLI (simple mode)
 
   help
   status
+  doctor
   exit
 
   login [timeout=120] [cdp=auto|http://127.0.0.1:9222] [open=1] [phone=+6591234567]
@@ -402,6 +404,9 @@ export class App {
           return true;
         case "status":
           this.printStatus();
+          return false;
+        case "doctor":
+          await this.cmdDoctor(rest);
           return false;
         case "otp":
           await this.cmdLogin(["verify", ...rest]);
@@ -2556,6 +2561,107 @@ export class App {
     this.printData(this.events.slice(-count));
   }
 
+  private async cmdDoctor(rest: string[]): Promise<void> {
+    const parsed = parseKeyValueTokens(rest);
+    const runStoresCheck = parseBool(parsed.opts.stores, true);
+    const runProfileCheck = parseBool(parsed.opts.profile, true);
+
+    const checks: Array<{
+      name: string;
+      status: "pass" | "fail" | "skip";
+      detail: string;
+      ms: number;
+    }> = [];
+
+    const run = async (
+      name: string,
+      fn: () => Promise<string>,
+      shouldRun = true
+    ): Promise<void> => {
+      if (!shouldRun) {
+        checks.push({ name, status: "skip", detail: "disabled", ms: 0 });
+        return;
+      }
+      const start = Date.now();
+      try {
+        const detail = await fn();
+        checks.push({ name, status: "pass", detail, ms: Date.now() - start });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        checks.push({ name, status: "fail", detail: message, ms: Date.now() - start });
+      }
+    };
+
+    await run("region-config", async () => {
+      const region = this.activeRegion();
+      const origin = safeOrigin(region.apiBase);
+      if (!origin) {
+        throw new Error(`invalid apiBase: ${region.apiBase}`);
+      }
+      if (!region.appId || region.appId === "REQUIRED_SET_CHAGEE_APP_ID") {
+        return `${region.code} appId missing`;
+      }
+      return `${region.code} ${origin}`;
+    });
+
+    await run(
+      "stores-list",
+      async () => {
+        const region = this.activeRegion();
+        const res = await this.client.listStores({
+          latitude: this.state.session.latitude,
+          longitude: this.state.session.longitude,
+          pageNum: 1,
+          pageSize: 3,
+          isTakeaway: region.isTakeaway,
+          channelCode: region.channelCode
+        });
+        if (!isApiOk(res)) {
+          throw new Error(`errcode=${String(res.errcode ?? "")} errmsg=${String(res.errmsg ?? "")}`);
+        }
+        const stores = extractStores(envelopeData(res));
+        if (!Array.isArray(stores)) {
+          throw new Error("stores payload shape invalid");
+        }
+        return `ok stores=${stores.length}`;
+      },
+      runStoresCheck
+    );
+
+    await run(
+      "profile",
+      async () => {
+        if (!this.state.auth?.token) {
+          return "no auth session";
+        }
+        const res = await this.client.getCustomerInfo();
+        if (!isApiOk(res)) {
+          throw new Error(`errcode=${String(res.errcode ?? "")} errmsg=${String(res.errmsg ?? "")}`);
+        }
+        const userId = extractProfileUserId(envelopeData(res));
+        if (!userId) {
+          throw new Error("userId missing in profile payload");
+        }
+        return `userId=${userId}`;
+      },
+      runProfileCheck
+    );
+
+    const rows = checks.map((check) => [
+      check.name,
+      check.status.toUpperCase(),
+      `${check.ms}ms`,
+      truncateForTable(check.detail, 64)
+    ]);
+    printTable(["check", "status", "latency", "detail"], rows);
+
+    if (checks.some((check) => check.status === "fail")) {
+      console.log("Doctor summary: FAIL");
+      return;
+    }
+    console.log("Doctor summary: PASS");
+  }
+
   private async startStoreWatch(
     intervalSec: number,
     silent: boolean,
@@ -3590,6 +3696,16 @@ function formatDistanceKm(distanceMeters: number | undefined): string {
     return `${Math.round(distanceMeters)}m`;
   }
   return `${(distanceMeters / 1000).toFixed(1)}km`;
+}
+
+function truncateForTable(value: string, width: number): string {
+  if (value.length <= width) {
+    return value;
+  }
+  if (width <= 3) {
+    return value.slice(0, width);
+  }
+  return `${value.slice(0, width - 3)}...`;
 }
 
 function pickClosestStore(stores: StoreState[]): StoreState | undefined {
