@@ -24,6 +24,14 @@ import {
 } from "./api/client.js";
 import { maskPhone, printTable, toNum } from "./lib/format.js";
 import { parseBool, parseKeyValueTokens, parseNum, tokenize } from "./lib/parser.js";
+import {
+  evaluateSmartStartupLocationDecision,
+  normalizeLocationPolicy
+} from "./lib/location-policy.js";
+import type {
+  StartupLocationDecision,
+  StartupLocationRecommendation
+} from "./lib/location-policy.js";
 import { loadCustomRegionProfiles, regionFilePath } from "./lib/region-store.js";
 import { loadSession, saveSession, sessionFilePath } from "./lib/session-store.js";
 import { clearAuthToken } from "./lib/token-store.js";
@@ -145,19 +153,6 @@ interface BrowserLocation {
   accuracyMeters?: number;
 }
 
-interface StartupLocationDecision {
-  shouldRefreshWithIp: boolean;
-  shouldRunBrowserLocate: boolean;
-  reason?: string;
-  driftKm?: number;
-}
-
-interface StartupLocationRecommendation {
-  shouldRunBrowserLocate: boolean;
-  reason?: string;
-  driftKm?: number;
-}
-
 type BrowserCaptureStatus =
   | "success"
   | "connect_error"
@@ -182,14 +177,8 @@ interface BrowserTokenCaptureResult {
 }
 
 const LOCATION_SOURCES: readonly LocationSource[] = ["default", "ip", "browser", "manual"];
-const LOCATION_POLICIES: readonly LocationPolicy[] = ["smart", "ip-only", "manual-only"];
 const LOCATION_HEARTBEAT_MS = 60 * 1000;
 const LOCATION_CHANGE_EPSILON = 0.000001;
-const LOCATION_STARTUP_TTL_DEFAULT_OR_IP_MS = 30 * 60 * 1000;
-const LOCATION_STARTUP_TTL_BROWSER_MS = 6 * 60 * 60 * 1000;
-const LOCATION_STARTUP_TTL_MANUAL_MS = 24 * 60 * 60 * 1000;
-const LOCATION_STARTUP_DRIFT_REFRESH_KM = 50;
-const LOCATION_STARTUP_MANUAL_DRIFT_KM = 80;
 const PAYMENT_STATUS_POLL_MS = 5 * 1000;
 const PAYMENT_STATUS_ERROR_LOG_THROTTLE_MS = 30 * 1000;
 const PAYMENT_AWAIT_DEFAULT_TIMEOUT_SEC = 180;
@@ -2903,7 +2892,29 @@ export class App {
       return;
     }
 
-    const decision = this.evaluateSmartStartupLocationDecision(resolved);
+    const decisionInput: {
+      source: LocationSource;
+      updatedAt?: string;
+      latitude: number;
+      longitude: number;
+      resolvedLatitude?: number;
+      resolvedLongitude?: number;
+    } = {
+      source: this.state.session.locationSource,
+      latitude: this.state.session.latitude,
+      longitude: this.state.session.longitude
+    };
+    if (this.state.session.locationUpdatedAt !== undefined) {
+      decisionInput.updatedAt = this.state.session.locationUpdatedAt;
+    }
+    if (resolved?.latitude !== undefined) {
+      decisionInput.resolvedLatitude = resolved.latitude;
+    }
+    if (resolved?.longitude !== undefined) {
+      decisionInput.resolvedLongitude = resolved.longitude;
+    }
+
+    const decision: StartupLocationDecision = evaluateSmartStartupLocationDecision(decisionInput);
     const recommendation: StartupLocationRecommendation = {
       shouldRunBrowserLocate: decision.shouldRunBrowserLocate
     };
@@ -2920,63 +2931,6 @@ export class App {
     }
 
     await this.applyResolvedIpLocationAtStartup(resolved, decision.reason ?? "startup");
-  }
-
-  private evaluateSmartStartupLocationDecision(
-    resolved: BrowserLocation | undefined
-  ): StartupLocationDecision {
-    const source = this.state.session.locationSource;
-    const updatedAtMs = parseTimestampMs(this.state.session.locationUpdatedAt);
-    const now = Date.now();
-    const ageMs = updatedAtMs !== undefined ? Math.max(0, now - updatedAtMs) : undefined;
-    const driftKm =
-      resolved &&
-      Number.isFinite(this.state.session.latitude) &&
-      Number.isFinite(this.state.session.longitude)
-        ? haversineDistanceKm(
-            this.state.session.latitude,
-            this.state.session.longitude,
-            resolved.latitude,
-            resolved.longitude
-          )
-        : undefined;
-
-    const isDefaultOrIp = source === "default" || source === "ip";
-    let reason: string | undefined;
-
-    if (updatedAtMs === undefined) {
-      if (isDefaultOrIp || source === "browser") {
-        reason = "missing";
-      }
-    } else if (isDefaultOrIp && ageMs !== undefined && ageMs > LOCATION_STARTUP_TTL_DEFAULT_OR_IP_MS) {
-      reason = "ttl";
-    } else if (source === "browser" && ageMs !== undefined && ageMs > LOCATION_STARTUP_TTL_BROWSER_MS) {
-      reason = "ttl";
-    } else if (
-      source === "manual" &&
-      ageMs !== undefined &&
-      ageMs > LOCATION_STARTUP_TTL_MANUAL_MS &&
-      driftKm !== undefined &&
-      driftKm > LOCATION_STARTUP_MANUAL_DRIFT_KM
-    ) {
-      reason = "ttl+drift";
-    }
-
-    if (!reason && driftKm !== undefined && driftKm > LOCATION_STARTUP_DRIFT_REFRESH_KM) {
-      reason = "drift";
-    }
-
-    const decision: StartupLocationDecision = {
-      shouldRefreshWithIp: Boolean(reason && resolved),
-      shouldRunBrowserLocate: Boolean(reason)
-    };
-    if (reason !== undefined) {
-      decision.reason = reason;
-    }
-    if (driftKm !== undefined) {
-      decision.driftKm = driftKm;
-    }
-    return decision;
   }
 
   private async applyResolvedIpLocationAtStartup(
@@ -5279,44 +5233,6 @@ function parseDurationSeconds(value: unknown): number | undefined {
     return Math.floor(numeric / 1000);
   }
   return Math.floor(numeric);
-}
-
-function parseTimestampMs(value: string | undefined): number | undefined {
-  if (!value) {
-    return undefined;
-  }
-  const parsed = Date.parse(value);
-  if (!Number.isFinite(parsed)) {
-    return undefined;
-  }
-  return parsed;
-}
-
-function haversineDistanceKm(
-  lat1: number,
-  lng1: number,
-  lat2: number,
-  lng2: number
-): number {
-  const toRad = (deg: number): number => (deg * Math.PI) / 180;
-  const dLat = toRad(lat2 - lat1);
-  const dLng = toRad(lng2 - lng1);
-  const a =
-    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
-    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLng / 2) * Math.sin(dLng / 2);
-  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-  return 6371 * c;
-}
-
-function isLocationPolicy(value: unknown): value is LocationPolicy {
-  return typeof value === "string" && LOCATION_POLICIES.includes(value as LocationPolicy);
-}
-
-function normalizeLocationPolicy(
-  value: unknown,
-  fallback: LocationPolicy = "smart"
-): LocationPolicy {
-  return isLocationPolicy(value) ? value : fallback;
 }
 
 function locationAccuracyHint(source: LocationSource): string | undefined {
