@@ -20,6 +20,19 @@ const STATIC_BASE_HEADERS: Record<string, string> = {
   "accept-language": "en-US"
 };
 
+const REQUEST_TIMEOUT_MS = 12_000;
+const MAX_RETRY_ATTEMPTS = 3;
+const RETRYABLE_STATUS_CODES = new Set([408, 429, 500, 502, 503, 504]);
+const RETRYABLE_POST_PATH_PREFIXES = [
+  "/api/navigation/store/list",
+  "/api/navigation/store/getStoreWaitInfo",
+  "/api/navigation/goods/storeGoodsMenu",
+  "/api/navigation/goods/detail",
+  "/api/navigation/goods/shoppingCart/get",
+  "/api/navigation/payment/payResultList",
+  "/api/navigation/order/price"
+];
+
 export interface ApiHooks {
   onRequest?: (event: RequestEvent) => void;
   onResponse?: (event: ResponseEvent) => void;
@@ -236,51 +249,159 @@ export class ChageeClient {
       payload: body
     });
 
-    const requestInit: RequestInit = {
-      method,
-      headers
-    };
+    const requestInit: RequestInit = { method, headers };
     if (method === "POST" && body !== undefined) {
       requestInit.body = JSON.stringify(body);
     }
 
-    const start = Date.now();
-    const response = await fetch(url, requestInit);
-    const elapsedMs = Date.now() - start;
+    const retryable = isRetryableRequest(method, path);
+    const maxAttempts = retryable ? MAX_RETRY_ATTEMPTS : 1;
+    let lastFailure: ApiEnvelope | undefined;
 
-    const text = await response.text();
-    let parsed: unknown = text;
-    if (text.length > 0) {
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      const start = Date.now();
       try {
-        parsed = JSON.parse(text) as unknown;
-      } catch {
-        parsed = { errcode: String(response.status), errmsg: text };
+        const response = await fetchWithTimeout(url, requestInit, REQUEST_TIMEOUT_MS);
+        const elapsedMs = Date.now() - start;
+        const parsed = await parseResponseBody(response);
+
+        this.hooks?.onResponse?.({
+          ts: new Date().toISOString(),
+          method,
+          url,
+          status: response.status,
+          elapsedMs,
+          body: parsed
+        });
+
+        const envelope = normalizeEnvelope(parsed, response.status);
+        if (
+          retryable &&
+          attempt < maxAttempts &&
+          RETRYABLE_STATUS_CODES.has(response.status)
+        ) {
+          lastFailure = envelope;
+          await sleepWithJitter(attempt);
+          continue;
+        }
+        return envelope;
+      } catch (error) {
+        const elapsedMs = Date.now() - start;
+        const failure = buildTransportErrorEnvelope(error);
+        lastFailure = failure;
+
+        this.hooks?.onResponse?.({
+          ts: new Date().toISOString(),
+          method,
+          url,
+          status: 0,
+          elapsedMs,
+          body: failure
+        });
+
+        if (retryable && attempt < maxAttempts && isRetryableNetworkError(error)) {
+          await sleepWithJitter(attempt);
+          continue;
+        }
+        return failure;
       }
     }
 
-    this.hooks?.onResponse?.({
-      ts: new Date().toISOString(),
-      method,
-      url,
-      status: response.status,
-      elapsedMs,
-      body: parsed
+    return (
+      lastFailure ?? {
+        errcode: "NETWORK_ERROR",
+        errmsg: "Request failed after retries."
+      }
+    );
+  }
+}
+
+async function fetchWithTimeout(
+  url: string,
+  init: RequestInit,
+  timeoutMs: number
+): Promise<Response> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, {
+      ...init,
+      signal: controller.signal
     });
+  } finally {
+    clearTimeout(timeout);
+  }
+}
 
-    if (typeof parsed === "object" && parsed !== null) {
-      const envelope = parsed as ApiEnvelope;
-      if (envelope.errcode === undefined) {
-        envelope.errcode = String(response.status);
-      }
-      return envelope;
+async function parseResponseBody(response: Response): Promise<unknown> {
+  const text = await response.text();
+  if (text.length === 0) {
+    return "";
+  }
+  try {
+    return JSON.parse(text) as unknown;
+  } catch {
+    return { errcode: String(response.status), errmsg: text };
+  }
+}
+
+function normalizeEnvelope(parsed: unknown, statusCode: number): ApiEnvelope {
+  if (typeof parsed === "object" && parsed !== null) {
+    const envelope = parsed as ApiEnvelope;
+    if (envelope.errcode === undefined) {
+      envelope.errcode = String(statusCode);
     }
+    return envelope;
+  }
+  return {
+    errcode: String(statusCode),
+    errmsg: typeof parsed === "string" ? parsed : "Unexpected response",
+    data: parsed
+  };
+}
 
+function isRetryableRequest(method: "GET" | "POST", path: string): boolean {
+  if (method === "GET") {
+    return true;
+  }
+  return RETRYABLE_POST_PATH_PREFIXES.some((prefix) => path.startsWith(prefix));
+}
+
+function isRetryableNetworkError(error: unknown): boolean {
+  if (!(error instanceof Error)) {
+    return false;
+  }
+  if (error.name === "AbortError") {
+    return true;
+  }
+  const message = error.message.toLowerCase();
+  return (
+    message.includes("network") ||
+    message.includes("fetch") ||
+    message.includes("timeout") ||
+    message.includes("socket")
+  );
+}
+
+function buildTransportErrorEnvelope(error: unknown): ApiEnvelope {
+  if (error instanceof Error && error.name === "AbortError") {
     return {
-      errcode: String(response.status),
-      errmsg: typeof parsed === "string" ? parsed : "Unexpected response",
-      data: parsed
+      errcode: "NETWORK_TIMEOUT",
+      errmsg: `Request timed out after ${REQUEST_TIMEOUT_MS}ms.`
     };
   }
+  const message = error instanceof Error ? error.message : String(error);
+  return {
+    errcode: "NETWORK_ERROR",
+    errmsg: message || "Network request failed."
+  };
+}
+
+async function sleepWithJitter(attempt: number): Promise<void> {
+  const baseMs = 220 * 2 ** Math.max(0, attempt - 1);
+  const jitterMs = Math.floor(Math.random() * 120);
+  const delayMs = Math.min(2000, baseMs + jitterMs);
+  await new Promise((resolve) => setTimeout(resolve, delayMs));
 }
 
 function buildHeaders(region: RegionProfile, token?: string): Record<string, string> {
