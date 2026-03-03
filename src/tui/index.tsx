@@ -515,6 +515,20 @@ function TuiRoot(props: TuiRootProps): React.JSX.Element {
         try {
           const options = await appRef.current.getItemSkuOptions(row.item.spuId);
           if (options.length === 0) {
+            try {
+              await appRef.current.refreshMenuForSelectedStore(true);
+              const snapshot = appRef.current.stateSnapshot();
+              setAppState(snapshot);
+              const stillVisible = snapshot.menuCache.some((category) =>
+                category.items.some((item) => item.spuId === row.item.spuId)
+              );
+              if (!stillVisible) {
+                pushLog(`${row.item.name} is sold out and has been removed from menu.`);
+                return;
+              }
+            } catch {
+              // Fall through to existing "no variants" message if menu refresh fails.
+            }
             pushLog(`No sellable variants for ${row.item.name}`);
             return;
           }

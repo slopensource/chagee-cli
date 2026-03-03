@@ -297,9 +297,10 @@ export class App {
 
     await this.applyStartupLocationPolicy();
     this.syncMenuCacheForSelectedStore();
-    if (this.state.selectedStore?.storeNo && !this.hasMenuCacheForStore(this.state.selectedStore.storeNo)) {
+    if (this.state.selectedStore?.storeNo) {
       try {
-        await this.ensureMenuForSelectedStore(true);
+        // Refresh menu at startup to avoid using stale sold-out data from previous sessions.
+        await this.ensureMenuForSelectedStore(true, true);
       } catch {
         // Keep startup resilient if menu prefetch fails.
       }
@@ -653,13 +654,16 @@ export class App {
     this.state.menuCacheByStore[storeNo] = this.state.menuCache;
   }
 
-  private async ensureMenuForSelectedStore(silent: boolean): Promise<void> {
+  private async ensureMenuForSelectedStore(
+    silent: boolean,
+    forceRefresh = false
+  ): Promise<void> {
     const storeNo = this.state.selectedStore?.storeNo;
     if (!storeNo) {
       this.state.menuCache = [];
       return;
     }
-    if (this.hasMenuCacheForStore(storeNo)) {
+    if (!forceRefresh && this.hasMenuCacheForStore(storeNo)) {
       this.syncMenuCacheForSelectedStore();
       return;
     }
@@ -1488,7 +1492,7 @@ export class App {
       }
       this.state.session.storePinned = true;
       this.syncMenuCacheForSelectedStore();
-      await this.ensureMenuForSelectedStore(true);
+      await this.ensureMenuForSelectedStore(true, true);
 
       await this.persist();
       console.log(`Selected store ${this.state.selectedStore.storeNo}`);
@@ -1629,7 +1633,7 @@ export class App {
       this.state.selectedStore = closest;
       this.state.session.storePinned = false;
       this.syncMenuCacheForSelectedStore();
-      await this.ensureMenuForSelectedStore(true);
+      await this.ensureMenuForSelectedStore(true, changed);
       if (changed) {
         await this.persist();
         console.log(
@@ -3070,11 +3074,12 @@ export class App {
     }
     this.syncMenuCacheForSelectedStore();
     const selectedStoreNo = this.state.selectedStore?.storeNo;
+    const storeChanged = selectedStoreNo !== previousStoreNo;
     if (
       selectedStoreNo &&
-      (selectedStoreNo !== previousStoreNo || !this.hasMenuCacheForStore(selectedStoreNo))
+      (storeChanged || !this.hasMenuCacheForStore(selectedStoreNo))
     ) {
-      await this.ensureMenuForSelectedStore(true);
+      await this.ensureMenuForSelectedStore(true, storeChanged);
     }
 
     if (!silent) {
@@ -3644,6 +3649,10 @@ export class App {
 
   async execute(raw: string, options: ExecuteOptions = {}): Promise<boolean> {
     return this.dispatch(raw, options.source ?? "shell");
+  }
+
+  async refreshMenuForSelectedStore(silent = true): Promise<void> {
+    await this.ensureMenuForSelectedStore(silent, true);
   }
 
   startupLocationRecommendationSnapshot(): StartupLocationRecommendation {
